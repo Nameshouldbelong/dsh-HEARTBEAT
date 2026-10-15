@@ -84,7 +84,14 @@ function runPing(key) {
 
   let pingBody;
   try {
-    pingBody = buildPingBody(rec.body);
+    const pj = JSON.parse(buildPingBody(rec.body).toString('utf8'));
+    // P0: ping 必须携带与真实请求相同的注入(cache_control ttl=1h + 亲和键),
+    // 否则无顶层 cache_control 只读 5m 池且无亲和路由, 间隔>5min 必 miss
+    if (INJECT_TTL && !pj.cache_control) pj.cache_control = { type: 'ephemeral', ttl: '1h' };
+    if (INJECT_AFFINITY && !(pj.metadata && pj.metadata.user_id)) {
+      pj.metadata = Object.assign({}, pj.metadata, { user_id: key });
+    }
+    pingBody = Buffer.from(JSON.stringify(pj), 'utf8');
   } catch (e) {
     return;
   }
