@@ -32,10 +32,15 @@ export async function resolveSessionKey(sessionId, statePath) {
     if (list.length > 0) {
       const match = list.find((s) => s.key === sessionId || s.key.includes(sessionId));
       if (match) return match.key;
+      // 最近活跃策略: /HTON 时当前会话刚有过流量, 10min 内最新 lastSeen 的 key 即当前会话
+      const fresh = list
+        .filter((s) => s.lastSeenAt && Date.now() - Date.parse(s.lastSeenAt) < 10 * 60 * 1000)
+        .sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt));
+      if (fresh.length > 0) return fresh[0].key;
       if (list.length === 1) return list[0].key;
     }
   } catch {}
-  return `dshsc-${sessionId.slice(0, 16)}`;
+  throw new Error('unresolved-session: 当前会话没有最近的缓存活动, 先对话一轮再 /HTON');
 }
 
 export async function executeHton(sessionId, statePath) {
