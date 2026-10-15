@@ -22,7 +22,7 @@
   "license": "MIT",
   "exports": {
     ".": "./lib/index.mjs",
-    "./client": "./lib/client.mjs",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   }
 }

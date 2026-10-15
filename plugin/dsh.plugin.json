@@ -11,6 +11,6 @@
     "skills": []
   },
   "client": {
-    "main": "./lib/client.mjs"
+    "main": "./lib/client.js"
   }
 }
