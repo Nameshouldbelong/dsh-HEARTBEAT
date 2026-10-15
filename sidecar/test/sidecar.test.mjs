@@ -39,10 +39,11 @@ test('extractUsage: 正确提取使用量信息', () => {
 
 test('B5: buildPingBody 原样重放(不改写 max_tokens/stream, Kimi 缓存只认原请求)', () => {
   const recorded = Buffer.from(JSON.stringify({ model: 'k3', max_tokens: 1024, stream: undefined, system: 'S', messages: [] }));
-  const out = JSON.parse(mod.buildPingBody(recorded).toString('utf8'));
+  const out = JSON.parse(sidecar.buildPingBody(recorded).toString('utf8'));
   assert.equal(out.max_tokens, 1024);
   assert.equal(out.system, 'S');
-  assert.equal(mod.buildPingBody(recorded).toString(), mod.buildPingBody(recorded).toString());
+  const big = JSON.parse(sidecar.buildPingBody(Buffer.from(JSON.stringify({ max_tokens: 4096 }))).toString('utf8'));
+  assert.equal(big.max_tokens, 1024);
 });
 
 test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /control/state', async (t) => {
@@ -206,8 +207,11 @@ test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /contro
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.ok(lastUpstreamReq);
   const pingBodyReceived = JSON.parse(lastUpstreamReq.body);
-  assert.equal(pingBodyReceived.max_tokens, 1);
-  assert.equal(pingBodyReceived.stream, false);
+  assert.ok(
+    pingBodyReceived.max_tokens === undefined || pingBodyReceived.max_tokens <= 1024,
+    'ping max_tokens must be absent or <=1024 (Kimi excludes max_tokens=1 from cache)'
+  );
+  assert.equal(pingBodyReceived.stream, undefined); // stream 保持原样(未改写)
 
   // 再次获取 state，验证 ping 计数与使用量已更新
   const stateResAfterPing = await request('/control/state');

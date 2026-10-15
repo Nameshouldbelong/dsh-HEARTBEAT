@@ -62,10 +62,12 @@ const pings = new Map(); // key -> { key, on, intervalMin, lastPingAt, pingCount
 const pingTimers = new Map(); // key -> Timeout/Interval
 
 function buildPingBody(recordedBuffer) {
-  // 2026-10-15 实测(Kimi coding 端点): max_tokens=1 / 改写任何字段的请求不参与前缀缓存
-  // (连发双 miss), 必须字节级原样重放录得的(已注入)请求体才会命中。
-  // 代价: ping 会生成完整回复(output 计入配额), 由 interval 下限与 stale 判定控制成本。
-  return Buffer.from(recordedBuffer);
+  // 2026-10-15 实测(Kimi coding 端点): max_tokens=1 的请求不参与前缀缓存(连发双 miss),
+  // max_tokens=16/100/1024 均正常命中。故 ping 仅把 max_tokens 钳到 <=1024 封顶输出成本,
+  // 其余字段一律保持原样(含注入的 cache_control/user_id, 由记录时机保证已注入)。
+  const j = JSON.parse(recordedBuffer.toString('utf8'));
+  if (typeof j.max_tokens === 'number') j.max_tokens = Math.min(j.max_tokens, 1024);
+  return Buffer.from(JSON.stringify(j), 'utf8');
 }
 
 function runPing(key) {
