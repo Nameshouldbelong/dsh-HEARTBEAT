@@ -14,9 +14,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const PORT = parseInt(process.env.SIDECAR_PORT || '8791', 10);
-const UPSTREAM_HOST = process.env.UPSTREAM_HOST || 'api.kimi.com';
-const UPSTREAM_PREFIX = process.env.UPSTREAM_PREFIX || '/coding';
+function getUpstreamHost() { return process.env.UPSTREAM_HOST || 'api.kimi.com'; }
+function getUpstreamPrefix() { return process.env.UPSTREAM_PREFIX || '/coding'; }
+function getUpstreamPort() { return parseInt(process.env.UPSTREAM_PORT || (process.env.UPSTREAM_PROTOCOL === 'http' ? '80' : '443'), 10); }
+function isUpstreamHttps() { return process.env.UPSTREAM_PROTOCOL !== 'http' && getUpstreamPort() === 443; }
+function getUpstreamTransport() { return isUpstreamHttps() ? https : http; }
 const INJECT_TTL = process.env.INJECT_TTL !== '0';
 const INJECT_AFFINITY = process.env.INJECT_AFFINITY !== '0';
 const LOG = path.join(__dirname, 'usage.jsonl');
@@ -53,18 +55,246 @@ function extractUsage(txt) {
   return merged;
 }
 
+// B1-B5 内存数据结构
+const sessions = new Map(); // key -> { key, lastSeenAt, model, lastStatus, lastInputTokens, lastCacheRead, lastSeenMs }
+const recordedRequests = new Map(); // key -> { body: Buffer, path: string, headers: object, model: string, lastSeenMs: number }
+const pings = new Map(); // key -> { key, on, intervalMin, lastPingAt, pingCount, stale, lastUsage, consecutiveZeroCacheRead }
+const pingTimers = new Map(); // key -> Timeout/Interval
+
+function buildPingBody(recordedBuffer) {
+  const j = JSON.parse(recordedBuffer.toString('utf8'));
+  j.max_tokens = 1;
+  j.stream = false;
+  return Buffer.from(JSON.stringify(j), 'utf8');
+}
+
+function runPing(key) {
+  const pingState = pings.get(key);
+  if (!pingState || !pingState.on || pingState.stale) return;
+  const rec = recordedRequests.get(key);
+  if (!rec) return;
+
+  // 并发保护：该 key 的真实请求 lastSeen <10s 时本次重放顺延 30s
+  const now = Date.now();
+  if (now - rec.lastSeenMs < 10000) {
+    const delayTimer = setTimeout(() => runPing(key), 30000);
+    if (delayTimer.unref) delayTimer.unref();
+    return;
+  }
+
+  let pingBody;
+  try {
+    pingBody = buildPingBody(rec.body);
+  } catch (e) {
+    return;
+  }
+
+  const headers = Object.assign({}, rec.headers, {
+    host: getUpstreamHost(),
+    'content-length': pingBody.length,
+    'accept-encoding': 'identity',
+    'content-type': 'application/json',
+  });
+  delete headers.connection;
+  delete headers['transfer-encoding'];
+
+  const upReq = getUpstreamTransport().request(
+    {
+      hostname: getUpstreamHost(),
+      port: getUpstreamPort(),
+      path: getUpstreamPrefix() + rec.path,
+      method: 'POST',
+      headers,
+    },
+    (upRes) => {
+      const respChunks = [];
+      upRes.on('data', (c) => respChunks.push(c));
+      upRes.on('end', () => {
+        const txt = Buffer.concat(respChunks).toString('utf8');
+        const usage = extractUsage(txt);
+        log({
+          ts: new Date().toISOString(),
+          path: rec.path,
+          status: upRes.statusCode,
+          kind: 'ping',
+          key,
+          usage,
+        });
+        console.log(`[ping] key=${key} status=${upRes.statusCode} cache_read=${usage.cache_read_input_tokens || 0}`);
+        pingState.lastPingAt = new Date().toISOString();
+        pingState.pingCount = (pingState.pingCount || 0) + 1;
+        pingState.lastUsage = usage;
+
+        // stale 判定：连续 3 次 ping 的 usage.cache_read_input_tokens == 0 -> 挂起置 stale=true
+        const cacheRead = Number(usage.cache_read_input_tokens || 0);
+        if (cacheRead === 0) {
+          pingState.consecutiveZeroCacheRead = (pingState.consecutiveZeroCacheRead || 0) + 1;
+          if (pingState.consecutiveZeroCacheRead >= 3) {
+            pingState.stale = true;
+            console.log(`[ping] key=${key} marked stale (3 consecutive zero cache read)`);
+          }
+        } else {
+          pingState.consecutiveZeroCacheRead = 0;
+        }
+      });
+    }
+  );
+
+  upReq.on('error', (e) => {
+    log({
+      ts: new Date().toISOString(),
+      path: rec.path,
+      status: 502,
+      kind: 'ping',
+      key,
+      error: String(e),
+    });
+  });
+
+  upReq.end(pingBody);
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, inject_ttl: INJECT_TTL, inject_affinity: INJECT_AFFINITY, upstream: UPSTREAM_HOST + UPSTREAM_PREFIX }));
+    res.end(JSON.stringify({ ok: true, inject_ttl: INJECT_TTL, inject_affinity: INJECT_AFFINITY, upstream: getUpstreamHost() + getUpstreamPrefix() }));
     return;
   }
+
+  // B1: GET /sessions
+  if (req.method === 'GET' && req.url === '/sessions') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      sessions: Array.from(sessions.values()).map((s) => ({
+        key: s.key,
+        lastSeenAt: s.lastSeenAt,
+        model: s.model,
+        lastStatus: s.lastStatus,
+        lastInputTokens: s.lastInputTokens,
+        lastCacheRead: s.lastCacheRead,
+      })),
+    }));
+    return;
+  }
+
+  // B4: GET /control/state
+  if (req.method === 'GET' && req.url === '/control/state') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      pings: Array.from(pings.values()).map((p) => ({
+        key: p.key,
+        on: p.on,
+        intervalMin: p.intervalMin,
+        lastPingAt: p.lastPingAt,
+        pingCount: p.pingCount,
+        stale: p.stale,
+        lastUsage: p.lastUsage,
+      })),
+    }));
+    return;
+  }
+
+  // B2: POST /control/on
+  if (req.method === 'POST' && req.url === '/control/on') {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch (e) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid-json' }));
+        return;
+      }
+      const key = body?.key;
+      if (!key || typeof key !== 'string') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid-key' }));
+        return;
+      }
+      let intervalMin = body.intervalMin !== undefined ? Number(body.intervalMin) : 50;
+      if (!Number.isInteger(intervalMin) || intervalMin < 1 || intervalMin > 720) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid-interval' }));
+        return;
+      }
+      if (!recordedRequests.has(key)) {
+        res.writeHead(409, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'no-request-recorded' }));
+        return;
+      }
+
+      if (pingTimers.has(key)) {
+        clearInterval(pingTimers.get(key));
+        pingTimers.delete(key);
+      }
+      const existing = pings.get(key) || {};
+      const state = {
+        key,
+        on: true,
+        intervalMin,
+        lastPingAt: existing.lastPingAt || null,
+        pingCount: existing.pingCount || 0,
+        stale: false,
+        lastUsage: existing.lastUsage || null,
+        consecutiveZeroCacheRead: 0,
+      };
+      pings.set(key, state);
+      const timer = setInterval(() => runPing(key), intervalMin * 60 * 1000);
+      if (timer.unref) timer.unref();
+      pingTimers.set(key, timer);
+
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        state: {
+          key: state.key,
+          on: state.on,
+          intervalMin: state.intervalMin,
+          lastPingAt: state.lastPingAt,
+          pingCount: state.pingCount,
+          stale: state.stale,
+          lastUsage: state.lastUsage,
+        },
+      }));
+    });
+    return;
+  }
+
+  // B3: POST /control/off
+  if (req.method === 'POST' && req.url === '/control/off') {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let body = {};
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch (e) {}
+      const key = body?.key;
+      if (key && pingTimers.has(key)) {
+        clearInterval(pingTimers.get(key));
+        pingTimers.delete(key);
+      }
+      if (key && pings.has(key)) {
+        pings.get(key).on = false;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+
+  // 转发上游 (原逻辑)
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
     let body = Buffer.concat(chunks);
     const injected = [];
     const ct = (req.headers['content-type'] || '').toLowerCase();
+    let currentKey = null;
+    let currentModel = 'unknown';
+
     if (ct.includes('json') && body.length) {
       try {
         const j = JSON.parse(body.toString('utf8'));
@@ -80,20 +310,50 @@ const server = http.createServer((req, res) => {
           } else {
             injected.push('user_id=client');
           }
+          currentKey = aff.id;
+        } else {
+          currentKey = affinityKey(j).id;
         }
+        currentModel = j.model || 'unknown';
         body = Buffer.from(JSON.stringify(j), 'utf8');
+
+        // B5: 记录最后真实请求体 (非 ping)
+        if (currentKey) {
+          recordedRequests.set(currentKey, {
+            body: Buffer.from(JSON.stringify(j), 'utf8'),
+            path: req.url,
+            headers: req.headers,
+            model: currentModel,
+            lastSeenMs: Date.now(),
+          });
+          // 若有活跃 ping 循环但处于 stale 状态，真实流量到达时自动清 stale 并恢复循环
+          if (pings.has(currentKey)) {
+            const p = pings.get(currentKey);
+            if (p.stale) {
+              p.stale = false;
+              p.consecutiveZeroCacheRead = 0;
+              console.log(`[ping] key=${currentKey} cleared stale by real traffic`);
+            }
+            if (p.on && !pingTimers.has(currentKey)) {
+              const timer = setInterval(() => runPing(currentKey), p.intervalMin * 60 * 1000);
+              if (timer.unref) timer.unref();
+              pingTimers.set(currentKey, timer);
+            }
+          }
+        }
       } catch (e) {
         injected.push('body-parse-fail');
       }
     }
     const headers = Object.assign({}, req.headers, {
-      host: UPSTREAM_HOST,
+      host: getUpstreamHost(),
       'content-length': body.length,
       'accept-encoding': 'identity',
     });
     delete headers.connection;
-    const upReq = https.request(
-      { hostname: UPSTREAM_HOST, port: 443, path: UPSTREAM_PREFIX + req.url, method: req.method, headers },
+    delete headers['transfer-encoding'];
+    const upReq = getUpstreamTransport().request(
+      { hostname: getUpstreamHost(), port: getUpstreamPort(), path: getUpstreamPrefix() + req.url, method: req.method, headers },
       (upRes) => {
         const respChunks = [];
         res.writeHead(upRes.statusCode, upRes.headers);
@@ -103,6 +363,18 @@ const server = http.createServer((req, res) => {
           const txt = Buffer.concat(respChunks).toString('utf8');
           const usage = extractUsage(txt);
           log({ ts: new Date().toISOString(), path: req.url, status: upRes.statusCode, injected, usage });
+
+          if (currentKey) {
+            sessions.set(currentKey, {
+              key: currentKey,
+              lastSeenAt: new Date().toISOString(),
+              model: currentModel,
+              lastStatus: upRes.statusCode,
+              lastInputTokens: usage.input_tokens || 0,
+              lastCacheRead: usage.cache_read_input_tokens || 0,
+              lastSeenMs: Date.now(),
+            });
+          }
         });
         upRes.on('error', () => { try { res.end(); } catch (e) {} });
       }
@@ -118,4 +390,22 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, '127.0.0.1', () => console.log('kimi-cache-sidecar listening on 127.0.0.1:' + PORT + ' -> https://' + UPSTREAM_HOST + UPSTREAM_PREFIX));
+const getPort = () => parseInt(process.env.SIDECAR_PORT || '8791', 10);
+const PORT = getPort();
+
+if (require.main === module) {
+  server.listen(PORT, '127.0.0.1', () => console.log('kimi-cache-sidecar listening on 127.0.0.1:' + PORT + ' -> https://' + getUpstreamHost() + getUpstreamPrefix()));
+}
+
+module.exports = {
+  server,
+  affinityKey,
+  extractUsage,
+  buildPingBody,
+  runPing,
+  sessions,
+  recordedRequests,
+  pings,
+  pingTimers,
+  PORT,
+};

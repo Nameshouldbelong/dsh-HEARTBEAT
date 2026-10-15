@@ -1,0 +1,4 @@
+node_modules/
+*.log
+**/usage.jsonl
+.DS_Store
