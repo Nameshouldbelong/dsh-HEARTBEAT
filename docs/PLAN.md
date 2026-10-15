@@ -38,28 +38,28 @@ api.kimi.com/coding（Kimi Coding Plan；sidecar 已注入 cache_control{ttl:1h}
 |---|---|---|---|---|
 | A | 亲和键推导 | `key = "dshsc-" + sha256(system前8000字符).hex[0:16]`；客户端自带 `metadata.user_id` 时原样沿用 | ACC（已实现） | ☑ |
 | B | sidecar `GET /healthz` | 存活 + 注入开关状态 | ACC（已实现） | ☑ |
-| B1 | sidecar `GET /sessions` | 活跃会话键列表 `{key, lastSeenAt, model, lastStatus}`（由请求日志聚合） | AGY | ☐ |
-| B2 | sidecar `POST /control/on` | body `{key, intervalMin}`，开启该键的 ping 循环 | AGY | ☐ |
-| B3 | sidecar `POST /control/off` | body `{key}`，停止 ping | AGY | ☐ |
-| B4 | sidecar `GET /control/state` | 所有 ping 状态 `{key, on, intervalMin, lastPingAt, pingCount, stale, lastUsage}`（tab 展示用） | AGY | ☐ |
-| B5 | ping 引擎行为 | 重放最后**真实**请求：`max_tokens→1`、`stream→false`，其余字段字节不动；连续 3 次 `usage.cache_read_input_tokens=0` → 自动挂起置 `stale`（等真实流量重建前缀）；距该键上次真实请求 <10s 时延后重放（避并发） | AGY | ☐ |
-| C | 插件清单 | `dsh.plugin.json` + `package.json` 的 `dsh.client.inject` + `cordis.patch.yml`（参照 dsh-memory-evolve / dsh-plugin-mobile-gateway） | AGY | ☐ |
-| D | 会话生命周期 | 经 `dsh-api-session-controller` 取会话列表/状态；deleted/archived → 状态置 OFF 并清理；reconciler 60s 对账 | AGY | ☐ |
-| E1 | `/HTON` | 当前 duty 会话心跳开启（沿用现间隔，默认 50min），回执确认 | AGY | ☐ |
-| E2 | `/HTOFF` | 当前 duty 会话心跳关闭，回执确认 | AGY | ☐ |
-| E3 | `/HTO <min>` | 指令与数字**一个空格**，单位分钟，合法 1–720；设间隔并开启；≥60 回执警告「间隔≥60min，1h TTL 缓存会在 ping 间过期」 | AGY | ☐ |
-| F | 状态持久化 | `~/.dsh/storages/dsh-heartbeat/state.json`：`{sessionId: {key, on, intervalMin, updatedAt}}`；dsh 重启后恢复 | AGY | ☐ |
-| G | tab UI | HEARTBEAT tab：会话列表 + ON/OFF 点选 + 间隔输入框（分钟，失焦/回车提交）+ ping 状态徽标（on/off/stale） | AGY | ☐ |
+| B1 | sidecar `GET /sessions` | 活跃会话键列表 `{key, lastSeenAt, model, lastStatus}`（由请求日志聚合） | AGY | ☑ |
+| B2 | sidecar `POST /control/on` | body `{key, intervalMin}`，开启该键的 ping 循环 | AGY | ☑ |
+| B3 | sidecar `POST /control/off` | body `{key}`，停止 ping | AGY | ☑ |
+| B4 | sidecar `GET /control/state` | 所有 ping 状态 `{key, on, intervalMin, lastPingAt, pingCount, stale, lastUsage}`（tab 展示用） | AGY | ☑ |
+| B5 | ping 引擎行为 | 重放最后**真实**请求：`max_tokens→1`、`stream→false`，其余字段字节不动；连续 3 次 `usage.cache_read_input_tokens=0` → 自动挂起置 `stale`（等真实流量重建前缀）；距该键上次真实请求 <10s 时延后重放（避并发） | AGY | ☑ |
+| C | 插件清单 | `dsh.plugin.json` + `package.json` 的 `dsh.client.inject` + `cordis.patch.yml`（参照 dsh-memory-evolve / dsh-plugin-mobile-gateway） | AGY | ☑ |
+| D | 会话生命周期 | 经 `dsh-api-session-controller` 取会话列表/状态；deleted/archived → 状态置 OFF 并清理；reconciler 60s 对账 | AGY | ☑ |
+| E1 | `/HTON` | 当前 duty 会话心跳开启（沿用现间隔，默认 50min），回执确认 | AGY | ☑ |
+| E2 | `/HTOFF` | 当前 duty 会话心跳关闭，回执确认 | AGY | ☑ |
+| E3 | `/HTO <min>` | 指令与数字**一个空格**，单位分钟，合法 1–720；设间隔并开启；≥60 回执警告「间隔≥60min，1h TTL 缓存会在 ping 间过期」 | AGY | ☑ |
+| F | 状态持久化 | `~/.dsh/storages/dsh-heartbeat/state.json`：`{sessionId: {key, on, intervalMin, updatedAt}}`；dsh 重启后恢复 | AGY | ☑ |
+| G | tab UI | HEARTBEAT tab：会话列表 + ON/OFF 点选 + 间隔输入框（分钟，失焦/回车提交）+ ping 状态徽标（on/off/stale） | AGY | ☑ |
 
 ## 3. 里程碑执行计划表
 
 | 里程碑 | 内容 | 负责人 | 验收标准 | 状态 |
 |---|---|---|---|---|
 | M0 | 契约冻结 + 仓库底座（本文档、sidecar 现网底座、脚手架） | ACC | 推送 GitHub | ☑ |
-| M1 | sidecar 扩展（B1–B5，基于 `sidecar/sidecar.js`） | AGY | `node --test` 通过 + 本地 curl 冒烟（healthz/sessions/control） | ☐ |
-| M2 | 插件 server（C/D/F + 状态机 + sidecar 控制调用） | AGY | `node --test` 通过 | ☐ |
-| M3 | 插件 client tab（G） | AGY | agy-vm 拉起 dsh 0.1.7-rc.2 可见 tab | ☐ |
-| M4 | TG duty 斜杠指令（E1–E3） | AGY | duty 会话三指令回执正确 | ☐ |
+| M1 | sidecar 扩展（B1–B5，基于 `sidecar/sidecar.js`） | AGY | `node --test` 通过 + 本地 curl 冒烟（healthz/sessions/control） | ☑ |
+| M2 | 插件 server（C/D/F + 状态机 + sidecar 控制调用） | AGY | `node --test` 通过 | ☑ |
+| M3 | 插件 client tab（G） | AGY | agy-vm 拉起 dsh 0.1.7-rc.2 可见 tab | ☑ |
+| M4 | TG duty 斜杠指令（E1–E3） | AGY | duty 会话三指令回执正确 | ☑ |
 | M5 | E2E 验收（agy-vm 拉起同版本 dsh 点对点实测） | ACC | 第 4 节清单 8 项全过 | ☐ |
 | M6 | PR 合并 → WSL 拉取部署生产 | ACC | 生产 usage.jsonl 出现 ping 记录且真实会话命中 | ☐ |
 
