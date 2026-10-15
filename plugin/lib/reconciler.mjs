@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { readState, removeSessionState } from './state.mjs';
 import { sidecarControlOn, sidecarControlOff } from './sidecar-client.mjs';
 
@@ -107,4 +108,37 @@ export function startReconciler({ ctx, statePath, intervalMs = 60000 }) {
   if (timer.unref) timer.unref();
 
   return () => clearInterval(timer);
+}
+
+const labelCache = new Map();
+export function getSessionLabel(id) {
+  if (labelCache.has(id)) return labelCache.get(id);
+  let label = null;
+  try {
+    const base = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== '' ? process.env.DSH_HOME : path.join(os.homedir(), '.dsh');
+    const root = path.join(base, 'sessions');
+    for (const ws of fs.readdirSync(root)) {
+      const f = path.join(root, ws, id, 'session.v4.jsonl.zstd');
+      try {
+        if (!fs.existsSync(f)) continue;
+        const r = spawnSync('zstd', ['-dc', f], { maxBuffer: 8 * 1024 * 1024, timeout: 8000 });
+        const text = (r.stdout || Buffer.alloc(0)).toString('utf8');
+        for (const line of text.split('\n')) {
+          if (!line.includes('"user/message"')) continue;
+          try {
+            const d = JSON.parse(line);
+            const src = d.data && d.data.source && d.data.source.kind;
+            if (src && src !== 'user') continue;
+            const c = d.data && d.data.content;
+            const t = Array.isArray(c) ? c.map((x) => x.text || '').join(' ') : String(c || '');
+            if (t.trim()) { label = t.trim().slice(0, 60); break; }
+          } catch {}
+        }
+      } catch {}
+      if (label) break;
+    }
+  } catch {}
+  if (!label) label = id;
+  labelCache.set(id, label);
+  return label;
 }

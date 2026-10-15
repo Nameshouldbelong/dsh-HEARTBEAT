@@ -160,6 +160,27 @@ const styles = `
   color: var(--dsh-text-muted, #9ca3af);
 }
 `;
+const stylesFix = `
+.hb-container { color: #111827; }
+.hb-container .hb-title { color: #111827; }
+.hb-container .hb-subtitle { color: #6b7280; }
+.hb-container td { color: #111827; border-color: #e5e7eb; }
+.hb-container th { color: #f9fafb; }
+.hb-container .hb-mono { color: #6b7280 !important; }
+.hb-container .hb-warning { color: #b45309; }
+.hb-container .hb-banner, .hb-container [class*="hb-note"] { color: #92400e; }
+.hb-container .hb-btn-toggle[disabled] { opacity: 0.45; cursor: not-allowed; }
+@media (prefers-color-scheme: dark) {
+  .hb-container { color: #e5e7eb; }
+  .hb-container .hb-title { color: #f3f4f6; }
+  .hb-container .hb-subtitle { color: #9ca3af; }
+  .hb-container td { color: #e5e7eb; border-color: #374151; }
+  .hb-container .hb-mono { color: #9ca3af !important; }
+  .hb-container .hb-warning { color: #fbbf24; }
+  .hb-container .hb-banner, .hb-container [class*="hb-note"] { color: #fcd34d; }
+}
+`;
+
 
 function createHeartbeatClient(React) {
   const { createElement: h, useState, useEffect, useCallback } = React;
@@ -334,8 +355,10 @@ function createHeartbeatClient(React) {
                     h('button', {
                       type: 'button',
                       className: `hb-btn-toggle ${isOn ? 'hb-btn-turn-off' : 'hb-btn-turn-on'}`,
+                      disabled: !s.key,
+                      title: !s.key ? '此会话暂无缓存活动：先对话一轮再开启' : '',
                       onClick: () => handleToggle(s.sessionId, isOn, s.intervalMin),
-                    }, isOn ? '关闭心跳 (OFF)' : '开启心跳 (ON)')
+                    }, !s.key ? '未激活 (无缓存)' : (isOn ? '关闭心跳 (OFF)' : '开启心跳 (ON)'))
                   ),
                   h('td', null,
                     h('div', { className: 'hb-mono', style: { fontSize: 11 } },
@@ -378,7 +401,7 @@ export function apply(ctx) {
     if (existing) return () => {};
     const tag = document.createElement('style');
     tag.dataset.heartbeatCss = '1';
-    tag.textContent = styles;
+    tag.textContent = styles + stylesFix;
     document.head.appendChild(tag);
     return () => tag.remove();
   }, 'dsh-heartbeat: stylesheet');
@@ -410,7 +433,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           if (existing) return () => {};
           const tag = document.createElement('style');
           tag.dataset.heartbeatCss = '1';
-          tag.textContent = styles;
+          tag.textContent = styles + stylesFix;
           document.head.appendChild(tag);
           return () => tag.remove();
         }, 'dsh-heartbeat: stylesheet');

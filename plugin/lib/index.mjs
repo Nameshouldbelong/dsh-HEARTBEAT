@@ -7,7 +7,7 @@ import os from 'node:os';
 import { getDefaultStatePath, readState } from './state.mjs';
 import { sidecarControlState, sidecarSessions } from './sidecar-client.mjs';
 import { parseHtoParam, executeHton, executeHtoff, executeHto, resolveSessionKey } from './commands.mjs';
-import { getActiveSessionIds, startReconciler } from './reconciler.mjs';
+import { getActiveSessionIds, startReconciler, getSessionLabel } from './reconciler.mjs';
 
 export const name = 'dsh-heartbeat';
 export const inject = ['webServer', 'commands', 'sessionQuery', 'workspaceRegistry'];
@@ -229,7 +229,7 @@ export function apply(ctx) {
             seen.add(id);
             sessionsList.push({
               sessionId: id,
-              title: id,
+              title: getSessionLabel(id),
               key: s.key,
               on: s.on === true,
               intervalMin: s.intervalMin || 50,
@@ -245,7 +245,7 @@ export function apply(ctx) {
               try { key = await resolveSessionKey(id, statePath); } catch (e) { key = null; }
               sessionsList.push({
                 sessionId: id,
-                title: id,
+                title: getSessionLabel(id),
                 key,
                 on: false,
                 intervalMin: 50,
