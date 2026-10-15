@@ -241,7 +241,8 @@ export function apply(ctx) {
           for (const id of activeIds) {
             if (!seen.has(id)) {
               seen.add(id);
-              const key = await resolveSessionKey(id, statePath);
+              let key = null;
+              try { key = await resolveSessionKey(id, statePath); } catch (e) { key = null; }
               sessionsList.push({
                 sessionId: id,
                 title: id,
