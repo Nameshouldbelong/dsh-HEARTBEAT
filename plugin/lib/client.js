@@ -428,6 +428,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
     return module.exports;
   };
 
-  window.__ModuleLoader__.load({ id: 'dsh-heartbeat', factory });
+  try { window.__ModuleLoader__.load({ id: 'dsh-heartbeat', factory }); } catch (e) {}
   try { window.__ModuleLoader__.load({ id: 'dsh-external/dsh-heartbeat', factory }); } catch (e) {}
 }
