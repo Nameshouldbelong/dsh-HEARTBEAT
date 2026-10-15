@@ -40,59 +40,63 @@ export function getDutyTargetSessionId(ctx) {
 }
 
 function hookTelegramDutyCommands(statePath) {
-  const candidates = [
-    path.join(os.homedir(), 'dsh-plugin-telegram-duty/lib/local-commands.js'),
-    path.join(os.homedir(), '.dsh/profiles/mobile17/node_modules/@nameshouldbelong/dsh-telegram-duty/lib/local-commands.js'),
-  ];
-
-  for (const c of candidates) {
-    if (fs.existsSync(c)) {
-      try {
-        import(c).then(({ CommandRegistry }) => {
-          if (!CommandRegistry || !CommandRegistry.prototype) return;
-          const origResolve = CommandRegistry.prototype.resolve;
-          if (CommandRegistry.prototype._hbPatched) return;
-          CommandRegistry.prototype._hbPatched = true;
-
-          CommandRegistry.prototype.resolve = function(cmdName) {
-            const lower = (cmdName || '').toLowerCase();
-            if (lower === 'hton') {
-              return {
-                name: 'hton',
-                aliases: ['HTON'],
-                handler: async (args, env) => {
-                  const targetSessionId = env?.targetSessionId || 'telegram-duty';
-                  return await executeHton(targetSessionId, statePath);
-                },
-              };
-            }
-            if (lower === 'htoff') {
-              return {
-                name: 'htoff',
-                aliases: ['HTOFF'],
-                handler: async (args, env) => {
-                  const targetSessionId = env?.targetSessionId || 'telegram-duty';
-                  return await executeHtoff(targetSessionId, statePath);
-                },
-              };
-            }
-            if (lower === 'hto') {
-              return {
-                name: 'hto',
-                aliases: ['HTO'],
-                handler: async (args, env) => {
-                  const targetSessionId = env?.targetSessionId || 'telegram-duty';
-                  return await executeHto(args, targetSessionId, statePath);
-                },
-              };
-            }
-            return origResolve.call(this, cmdName);
-          };
-        }).catch(() => {});
-        break;
-      } catch {}
+  const base = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== '' ? process.env.DSH_HOME : path.join(os.homedir(), '.dsh');
+  const candidates = [];
+  try {
+    const profilesDir = path.join(base, 'profiles');
+    for (const prof of fs.readdirSync(profilesDir)) {
+      candidates.push(path.join(profilesDir, prof, 'node_modules', '@nameshouldbelong', 'dsh-telegram-duty', 'lib', 'local-commands.js'));
     }
+  } catch {}
+  candidates.push(path.join(os.homedir(), 'DSH', '插件制作', 'dsh-plugin-telegram-duty', 'lib', 'local-commands.js'));
+  candidates.push(path.join(os.homedir(), 'dsh-plugin-telegram-duty', 'lib', 'local-commands.js'));
+
+  let hooked = 0;
+  for (const c of candidates) {
+    if (!fs.existsSync(c)) continue;
+    import(c).then(({ CommandRegistry }) => {
+      if (!CommandRegistry || !CommandRegistry.prototype) return;
+      if (CommandRegistry.prototype._hbPatched) { hooked++; return; }
+      CommandRegistry.prototype._hbPatched = true;
+      const origResolve = CommandRegistry.prototype.resolve;
+      CommandRegistry.prototype.resolve = function (cmdName) {
+        const lower = String(cmdName || '').toLowerCase();
+        if (lower === 'hton') {
+          return {
+            name: 'hton', aliases: ['HTON'],
+            handler: async (args, env) => {
+              const targetSessionId = env?.targetSessionId || 'telegram-duty';
+              return await executeHton(targetSessionId, statePath);
+            },
+          };
+        }
+        if (lower === 'htoff') {
+          return {
+            name: 'htoff', aliases: ['HTOFF'],
+            handler: async (args, env) => {
+              const targetSessionId = env?.targetSessionId || 'telegram-duty';
+              return await executeHtoff(targetSessionId, statePath);
+            },
+          };
+        }
+        if (lower === 'hto') {
+          return {
+            name: 'hto', aliases: ['HTO'],
+            handler: async (args, env) => {
+              const targetSessionId = env?.targetSessionId || 'telegram-duty';
+              return await executeHto(args, targetSessionId, statePath);
+            },
+          };
+        }
+        return origResolve.call(this, cmdName);
+      };
+      hooked++;
+      console.log('[dsh-heartbeat] duty command hook installed:', c);
+    }).catch((e) => console.warn('[dsh-heartbeat] duty hook import failed:', c, String(e)));
   }
+  setTimeout(() => {
+    if (hooked === 0) console.warn('[dsh-heartbeat] duty command hook: no CommandRegistry instance found');
+  }, 15000);
 }
 
 async function readJsonBody(req, maxBytes = 64 * 1024) {
