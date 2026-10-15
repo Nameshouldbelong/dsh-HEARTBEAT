@@ -62,10 +62,10 @@ const pings = new Map(); // key -> { key, on, intervalMin, lastPingAt, pingCount
 const pingTimers = new Map(); // key -> Timeout/Interval
 
 function buildPingBody(recordedBuffer) {
-  const j = JSON.parse(recordedBuffer.toString('utf8'));
-  j.max_tokens = 1;
-  j.stream = false;
-  return Buffer.from(JSON.stringify(j), 'utf8');
+  // 2026-10-15 实测(Kimi coding 端点): max_tokens=1 / 改写任何字段的请求不参与前缀缓存
+  // (连发双 miss), 必须字节级原样重放录得的(已注入)请求体才会命中。
+  // 代价: ping 会生成完整回复(output 计入配额), 由 interval 下限与 stale 判定控制成本。
+  return Buffer.from(recordedBuffer);
 }
 
 function runPing(key) {
@@ -327,6 +327,7 @@ const server = http.createServer((req, res) => {
         // B5: 记录最后真实请求体 (非 ping)
         if (currentKey) {
           recordedRequests.set(currentKey, {
+          bodySha: require('crypto').createHash('sha256').update(body).digest('hex').slice(0,12),
             body: Buffer.from(JSON.stringify(j), 'utf8'),
             path: req.url,
             headers: req.headers,

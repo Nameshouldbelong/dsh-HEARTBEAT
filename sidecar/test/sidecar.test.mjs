@@ -37,32 +37,12 @@ test('extractUsage: 正确提取使用量信息', () => {
   assert.equal(usage.output_tokens, 25);
 });
 
-test('B5: buildPingBody 改写 max_tokens 为 1、stream 为 false，其余字段保持不变', () => {
-  const original = {
-    model: 'kimi-k3',
-    max_tokens: 4096,
-    stream: true,
-    system: 'System prompt text',
-    messages: [
-      { role: 'user', content: 'Hello assistant' },
-      { role: 'assistant', content: 'Hello user' },
-      { role: 'user', content: 'Continue work' },
-    ],
-    metadata: { user_id: 'dshsc-1234567890abcdef' },
-    cache_control: { type: 'ephemeral', ttl: '1h' },
-  };
-
-  const originalBuf = Buffer.from(JSON.stringify(original), 'utf8');
-  const pingBuf = sidecar.buildPingBody(originalBuf);
-  const parsed = JSON.parse(pingBuf.toString('utf8'));
-
-  assert.equal(parsed.max_tokens, 1);
-  assert.equal(parsed.stream, false);
-  assert.equal(parsed.model, original.model);
-  assert.equal(parsed.system, original.system);
-  assert.deepEqual(parsed.messages, original.messages);
-  assert.deepEqual(parsed.metadata, original.metadata);
-  assert.deepEqual(parsed.cache_control, original.cache_control);
+test('B5: buildPingBody 原样重放(不改写 max_tokens/stream, Kimi 缓存只认原请求)', () => {
+  const recorded = Buffer.from(JSON.stringify({ model: 'k3', max_tokens: 1024, stream: undefined, system: 'S', messages: [] }));
+  const out = JSON.parse(mod.buildPingBody(recorded).toString('utf8'));
+  assert.equal(out.max_tokens, 1024);
+  assert.equal(out.system, 'S');
+  assert.equal(mod.buildPingBody(recorded).toString(), mod.buildPingBody(recorded).toString());
 });
 
 test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /control/state', async (t) => {
