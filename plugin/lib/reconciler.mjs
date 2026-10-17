@@ -1,8 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawnSync } from 'node:child_process';
-import { readState, removeSessionState } from './state.mjs';
+import { readState, removeSessionState, updateSessionState } from './state.mjs';
 import { sidecarControlOn, sidecarControlOff } from './sidecar-client.mjs';
 
 export async function getActiveSessionIds(ctx) {
@@ -88,7 +87,13 @@ export async function runReconciliation({ ctx, statePath, activeSessionIds }) {
     // 活跃会话且 on: true -> 对 sidecar /control/on 做一次补挂（幂等）
     if (session.on && session.key) {
       try {
-        await sidecarControlOn(session.key, session.intervalMin || 50);
+        const res = await sidecarControlOn(session.key, session.intervalMin || 50);
+        // 409 no-request-recorded：sidecar 重启丢了内存请求体 -> 标记 waiting,
+        // UI 显示 WAITING FOR REAL REQUEST，真实流量到达后 sidecar 自动恢复
+        const waiting = res != null && res.status === 409;
+        if ((session.waiting === true) !== waiting) {
+          updateSessionState(statePath, sessionId, { waiting });
+        }
         reconciled.reconnected.push(sessionId);
       } catch {}
     }
@@ -110,35 +115,6 @@ export function startReconciler({ ctx, statePath, intervalMs = 60000 }) {
   return () => clearInterval(timer);
 }
 
-const labelCache = new Map();
-export function getSessionLabel(id) {
-  if (labelCache.has(id)) return labelCache.get(id);
-  let label = null;
-  try {
-    const base = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== '' ? process.env.DSH_HOME : path.join(os.homedir(), '.dsh');
-    const root = path.join(base, 'sessions');
-    for (const ws of fs.readdirSync(root)) {
-      const f = path.join(root, ws, id, 'session.v4.jsonl.zstd');
-      try {
-        if (!fs.existsSync(f)) continue;
-        const r = spawnSync('zstd', ['-dc', f], { maxBuffer: 8 * 1024 * 1024, timeout: 8000 });
-        const text = (r.stdout || Buffer.alloc(0)).toString('utf8');
-        for (const line of text.split('\n')) {
-          if (!line.includes('"user/message"')) continue;
-          try {
-            const d = JSON.parse(line);
-            const src = d.data && d.data.source && d.data.source.kind;
-            if (src && src !== 'user') continue;
-            const c = d.data && d.data.content;
-            const t = Array.isArray(c) ? c.map((x) => x.text || '').join(' ') : String(c || '');
-            if (t.trim()) { label = t.trim().slice(0, 60); break; }
-          } catch {}
-        }
-      } catch {}
-      if (label) break;
-    }
-  } catch {}
-  if (!label) label = id;
-  labelCache.set(id, label);
-  return label;
-}
+// 注意：会话标题一律来自 DSH canonical title（ctx.sessionQuery.readTitleSnapshots，
+// 见 index.mjs readSessionTitles）。严禁恢复「解压 session log 取首条 user prompt」
+// 的旧实现——它不是真实 session 名称、rename 不同步、且每次取名都要解压日志。

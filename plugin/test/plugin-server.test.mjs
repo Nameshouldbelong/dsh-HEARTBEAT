@@ -3,12 +3,48 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import http from 'node:http';
 import { apply, name, inject } from '../lib/index.mjs';
 import { readState } from '../lib/state.mjs';
+import * as reconciler from '../lib/reconciler.mjs';
 
-test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async () => {
+// 确定性 fake sidecar（不依赖本机真实 sidecar 8791）
+async function startFakeSidecar(t) {
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let r;
+      if (req.url === '/sessions') {
+        r = { status: 200, json: { sessions: [{ key: 'dshsc-fake', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+      } else if (req.url === '/control/on') {
+        r = { status: 200, json: { ok: true, immediatePing: true, state: {} } };
+      } else if (req.url === '/control/off') {
+        r = { status: 200, json: { ok: true } };
+      } else if (req.url === '/control/state') {
+        r = { status: 200, json: { pings: [] } };
+      } else {
+        r = { status: 404, json: {} };
+      }
+      res.writeHead(r.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(r.json));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  process.env.SIDECAR_PORT = String(server.address().port);
+  t.after(() => {
+    server.close();
+    delete process.env.SIDECAR_PORT;
+  });
+}
+
+test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async (t) => {
   const tmpStateFile = path.join(os.tmpdir(), `dsh-plugin-server-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
   process.env.DSH_HEARTBEAT_STATE_FILE = tmpStateFile;
+  await startFakeSidecar(t);
+
+  // 可变的 canonical title mock（模拟 Rename 后 latest-wins 变化）
+  const titleMap = new Map([['test-session-1', 'PRDM2 Analysis']]);
 
   try {
     let webHandler = null;
@@ -35,6 +71,14 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       sessionQuery: {
         async listSessions() {
           return [{ header: { id: 'test-session-1' } }, { header: { id: 'test-session-2' } }];
+        },
+        async readTitleSnapshots(sessionIds) {
+          return sessionIds.map((id) => {
+            const title = titleMap.get(id);
+            return title
+              ? { sessionId: id, status: 'fulfilled', value: { title: { title } } }
+              : { sessionId: id, status: 'fulfilled', value: {} };
+          });
         },
       },
       workspaceRegistry: {
@@ -72,6 +116,23 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
     assert.ok(Array.isArray(res1.result.json.sessions));
     assert.ok(res1.result.json.sessions.some((s) => s.sessionId === 'test-session-1'));
 
+    // Test 7: title 来自 canonical sessionQuery.readTitleSnapshots
+    const s1 = res1.result.json.sessions.find((s) => s.sessionId === 'test-session-1');
+    assert.equal(s1.title, 'PRDM2 Analysis');
+
+    // Rename 后下一次查询即同步（不缓存旧名）
+    titleMap.set('test-session-1', 'PRDM2 TAN Migration');
+    const res1b = mockRes();
+    await webHandler({ method: 'GET', url: '/heartbeat/api/state' }, res1b);
+    const s1b = res1b.result.json.sessions.find((s) => s.sessionId === 'test-session-1');
+    assert.equal(s1b.title, 'PRDM2 TAN Migration', 'Rename 后应立即同步新名称');
+
+    // Test 8: 无 title projection 的会话 -> title=null（client 显示短 sessionId），
+    // 绝不回退扫描首条 user prompt
+    const s2 = res1b.result.json.sessions.find((s) => s.sessionId === 'test-session-2');
+    assert.equal(s2.title, null);
+    assert.equal(typeof reconciler.getSessionLabel, 'undefined', 'getSessionLabel（首条 prompt 取名）必须已删除');
+
     // 2. 测试 Web API: POST /heartbeat/api/toggle
     const res2 = mockRes();
     const toggleReq = {
@@ -106,7 +167,7 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htonRes.kind, 'success');
-    assert.equal(htonRes.text, '💓 心跳已开启（间隔 60min）');
+    assert.equal(htonRes.text, '💓 心跳已开启（间隔 60min），已立即执行首次保温');
 
     // 5. 测试平台命令: /hto 30
     const htoCmd = registeredCommands.get('hto');
@@ -115,7 +176,7 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htoRes.kind, 'success');
-    assert.equal(htoRes.text, '💓 心跳间隔已设为 30min 并开启');
+    assert.equal(htoRes.text, '💓 心跳间隔已设为 30min 并开启，已立即执行首次保温');
 
     // 6. 测试平台命令: /hto 60 (>=60min 触发 1h TTL 告警)
     const hto60Res = await htoCmd.handler({
@@ -144,6 +205,48 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
 
     // 清理 effect
     for (const d of effectDisposers) d();
+  } finally {
+    delete process.env.DSH_HEARTBEAT_STATE_FILE;
+    fs.rmSync(tmpStateFile, { force: true });
+  }
+});
+
+test('Test 8b: sessionQuery 缺少 readTitleSnapshots（旧版 DSH）-> title=null 降级', async (t) => {
+  const tmpStateFile = path.join(os.tmpdir(), `dsh-plugin-t8-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  process.env.DSH_HEARTBEAT_STATE_FILE = tmpStateFile;
+  await startFakeSidecar(t);
+
+  try {
+    let webHandler = null;
+    const mockCtx = {
+      effect() {},
+      webServer: {
+        register({ path: routePath, handler }) {
+          if (routePath === '/heartbeat') webHandler = handler;
+        },
+      },
+      commands: { register() {} },
+      sessionQuery: {
+        // 0.1.5-rc.2 形态：只有 listSessions，没有 readTitleSnapshots
+        async listSessions() {
+          return [{ header: { id: 'legacy-session' } }];
+        },
+      },
+      workspaceRegistry: { archivedSessionIds: [] },
+    };
+
+    apply(mockCtx);
+
+    let body = '';
+    const res = {
+      writeHead() {},
+      end(d) { body = d; },
+    };
+    await webHandler({ method: 'GET', url: '/heartbeat/api/state' }, res);
+    const json = JSON.parse(body);
+    const s = json.sessions.find((x) => x.sessionId === 'legacy-session');
+    assert.ok(s);
+    assert.equal(s.title, null, '无 readTitleSnapshots 时 title 降级为 null（显示短 sessionId）');
   } finally {
     delete process.env.DSH_HEARTBEAT_STATE_FILE;
     fs.rmSync(tmpStateFile, { force: true });

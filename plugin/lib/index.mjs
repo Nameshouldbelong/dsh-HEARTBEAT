@@ -7,10 +7,30 @@ import os from 'node:os';
 import { getDefaultStatePath, readState } from './state.mjs';
 import { sidecarControlState, sidecarSessions } from './sidecar-client.mjs';
 import { parseHtoParam, executeHton, executeHtoff, executeHto, resolveSessionKey } from './commands.mjs';
-import { getActiveSessionIds, startReconciler, getSessionLabel } from './reconciler.mjs';
+import { getActiveSessionIds, startReconciler } from './reconciler.mjs';
 
 export const name = 'dsh-heartbeat';
 export const inject = ['webServer', 'commands', 'sessionQuery', 'workspaceRegistry'];
+
+// 读取 DSH canonical session title（sessionQuery.readTitleSnapshots, latest-wins 折叠
+// session/title 事件，含用户 Rename）。逐次实读不缓存，Rename 后下一次刷新即同步。
+// 任何失败一律降级为 null（client 显示短 sessionId），绝不回退到扫描首条 user prompt。
+async function readSessionTitles(ctx, sessionIds) {
+  const titles = new Map();
+  if (!sessionIds.length) return titles;
+  try {
+    const sq = ctx?.sessionQuery;
+    if (sq && typeof sq.readTitleSnapshots === 'function') {
+      const results = await sq.readTitleSnapshots(sessionIds);
+      for (const r of results || []) {
+        if (r && r.status === 'fulfilled' && r.value?.title?.title) {
+          titles.set(r.sessionId, r.value.title.title);
+        }
+      }
+    }
+  } catch {}
+  return titles;
+}
 
 export function getDutyTargetSessionId(ctx) {
   // 1. 尝试从 telegram-duty 启动配置 / storages 读取
@@ -233,9 +253,9 @@ export function apply(ctx) {
             seen.add(id);
             sessionsList.push({
               sessionId: id,
-              title: getSessionLabel(id),
               key: s.key,
               on: s.on === true,
+              waiting: s.waiting === true,
               intervalMin: s.intervalMin || 50,
               updatedAt: s.updatedAt,
             });
@@ -249,12 +269,19 @@ export function apply(ctx) {
               try { key = await resolveSessionKey(id, statePath); } catch (e) { key = null; }
               sessionsList.push({
                 sessionId: id,
-                title: getSessionLabel(id),
                 key,
                 on: false,
+                waiting: false,
                 intervalMin: 50,
               });
             }
+          }
+
+          // DSH canonical session title（Rename 后下一次刷新即同步；无 title 为 null，
+          // client 显示短 sessionId）
+          const titles = await readSessionTitles(ctx, [...seen]);
+          for (const s of sessionsList) {
+            s.title = titles.get(s.sessionId) || null;
           }
 
           sendJson(res, 200, {
