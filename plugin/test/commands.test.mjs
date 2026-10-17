@@ -177,3 +177,58 @@ test('第八章: sidecar 不可达 -> 诚实回执 + 保留开启意图', async 
     fs.rmSync(tmpFile, { force: true });
   }
 });
+
+test('KI-3: /HTON 存储 key 漂移（409）自动轮换到新鲜 key', async (t) => {
+  const tmpFile = path.join(os.tmpdir(), `dsh-cmd-ki3-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  await startFakeSidecar(t, (url, body) => {
+    if (url === '/sessions') {
+      return { status: 200, json: { sessions: [{ key: 'dshsc-fresh', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+    }
+    if (url === '/control/on') {
+      const key = JSON.parse(body || '{}').key;
+      if (key === 'dshsc-fresh') return { status: 200, json: { ok: true, immediatePing: true, state: {} } };
+      return { status: 409, json: { error: 'no-request-recorded', waiting: true } };
+    }
+    if (url === '/control/off') return { status: 200, json: { ok: true } };
+    return { status: 404, json: {} };
+  });
+
+  try {
+    const { updateSessionState } = await import('../lib/state.mjs');
+    const sessionId = 'test-duty-drift';
+    // 模拟漂移前存下的旧 key
+    updateSessionState(tmpFile, sessionId, { key: 'dshsc-stale', on: false, intervalMin: 50 });
+
+    const r = await executeHton(sessionId, tmpFile);
+    assert.equal(r, '💓 心跳已开启（间隔 50min），已立即执行首次保温', '轮换成功应直接开启而非 waiting');
+    const state = readState(tmpFile);
+    assert.equal(state.sessions[sessionId].key, 'dshsc-fresh');
+    assert.equal(state.sessions[sessionId].waiting, false);
+    assert.equal(state.sessions[sessionId].on, true);
+  } finally {
+    fs.rmSync(tmpFile, { force: true });
+  }
+});
+
+test('KI-3: /HTON 全新会话无流量（非存储 key）-> 不轮换，保持 waiting 语义', async (t) => {
+  const tmpFile = path.join(os.tmpdir(), `dsh-cmd-ki3c-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  await startFakeSidecar(t, (url) => {
+    if (url === '/sessions') {
+      return { status: 200, json: { sessions: [{ key: 'dshsc-only', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+    }
+    if (url === '/control/on') return { status: 409, json: { error: 'no-request-recorded', waiting: true } };
+    if (url === '/control/off') return { status: 200, json: { ok: true } };
+    return { status: 404, json: {} };
+  });
+
+  try {
+    const sessionId = 'test-duty-brand-new';
+    const r = await executeHton(sessionId, tmpFile);
+    assert.ok(r.includes('心跳意图已记录'), '首次解析的 key 409 应保持 waiting 语义: ' + r);
+    const state = readState(tmpFile);
+    assert.equal(state.sessions[sessionId].waiting, true);
+    assert.equal(state.sessions[sessionId].key, 'dshsc-only');
+  } finally {
+    fs.rmSync(tmpFile, { force: true });
+  }
+});

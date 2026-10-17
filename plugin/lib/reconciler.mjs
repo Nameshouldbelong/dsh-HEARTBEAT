@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { readState, removeSessionState, updateSessionState } from './state.mjs';
 import { sidecarControlOn, sidecarControlOff } from './sidecar-client.mjs';
+import { rotateStaleKey } from './commands.mjs';
 
 export async function getActiveSessionIds(ctx) {
   // 1. 尝试从 cordis 注入的 sessionQuery / workspaceRegistry 读取
@@ -88,9 +89,15 @@ export async function runReconciliation({ ctx, statePath, activeSessionIds }) {
     if (session.on && session.key) {
       try {
         const res = await sidecarControlOn(session.key, session.intervalMin || 50);
-        // 409 no-request-recorded：sidecar 重启丢了内存请求体 -> 标记 waiting,
+        // 409 no-request-recorded：sidecar 重启丢了内存请求体，或存储 key 已随
+        // system prompt 漂移失效（KI-3）。先试 key 轮换；不成则标记 waiting，
         // UI 显示 WAITING FOR REAL REQUEST，真实流量到达后 sidecar 自动恢复
-        const waiting = res != null && res.status === 409;
+        let waiting = res != null && res.status === 409;
+        if (waiting) {
+          const rotated = await rotateStaleKey(sessionId, statePath, session.key, session.intervalMin || 50)
+            .catch(() => null);
+          if (rotated) waiting = false;
+        }
         if ((session.waiting === true) !== waiting) {
           updateSessionState(statePath, sessionId, { waiting });
         }
