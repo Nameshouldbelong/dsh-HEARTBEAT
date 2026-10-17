@@ -62,7 +62,7 @@ api.kimi.com/coding（Kimi Coding Plan；sidecar 已注入 cache_control{ttl:1h}
 | M4 | TG duty 斜杠指令（E1–E3） | AGY | duty 会话三指令回执正确 | ☑ |
 | M5 | E2E 验收（agy-vm 拉起同版本 dsh 点对点实测） | ACC | 第 4 节清单 8 项全过 | ☐ |
 | M6 | PR 合并 → WSL 拉取部署生产 | ACC | 生产 usage.jsonl 出现 ping 记录且真实会话命中 | ☐ |
-| M7 | 增量修复（2026-10-17）：开启即 ping / 失败快速 retry(+2/+4min) / ping max_tokens 固定 16 / cache 三分类 health（hit/recreated/no-cache，transport 错误分离统计）/ canonical session title（sessionQuery.readTitleSnapshots，弃用首条 prompt 取名）/ UI 遥测列 / sidecar 重启 waiting 自动恢复 / telemetry 增强（latency_ms、result、四 usage 字段） | ACC | `node --test` 全绿 + agy-vm 预发实测 + 生产 HTON 立即 ping 且 cache_read>0 | ◐ |
+| M7 | 增量修复（2026-10-17）：开启即 ping / 失败快速 retry(+2/+4min) / ping max_tokens 固定 16 / cache 三分类 health（hit/recreated/no-cache，transport 错误分离统计）/ canonical session title（sessionQuery.readTitleSnapshots，弃用首条 prompt 取名）/ UI 遥测列 / sidecar 重启 waiting 自动恢复 / telemetry 增强（latency_ms、result、四 usage 字段） | ACC | `node --test` 全绿 + agy-vm 预发实测 + 生产 HTON 立即 ping 且 cache_read>0 | ◐（agy-vm 已全过，见 FINDINGS-2026-10-17；待生产冒烟）|
 
 ## 4. E2E 验收清单（合并门槛，agy-vm 实测）
 
