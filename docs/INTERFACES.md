@@ -22,26 +22,44 @@
 
 ### B2 `POST /control/on`
 请求 `{ "key": "dshsc-…", "intervalMin": 50 }`；intervalMin 缺省 50，范围 1–720。
-响应 200 `{ "ok": true, "state": {…} }`。若该 key 无已记录请求体 → 409 `{ "error": "no-request-recorded" }`。
+响应 200 `{ "ok": true, "immediatePing": true, "state": {…} }`——**开启即立即执行一次 ping**
+（不等首个 interval；仍受 B5 的 <10s 真实请求顺延 30s 保护）。
+若该 key 无已记录请求体 → 409 `{ "error": "no-request-recorded", "waiting": true }`，
+同时 sidecar 记录保温意图（`waitingForRequest`），下一次真实请求到达即自动开始 ping 循环。
 
 ### B3 `POST /control/off`
-请求 `{ "key": "dshsc-…" }`；对未知 key 也返回 200（幂等）。
+请求 `{ "key": "dshsc-…" }`；对未知 key 也返回 200（幂等）。同时清理 pending retry 定时器。
 
 ### B4 `GET /control/state`
 ```json
 { "pings": [ { "key": "…", "on": true, "intervalMin": 50,
   "lastPingAt": "…", "pingCount": 3, "stale": false,
-  "lastUsage": { "cache_read_input_tokens": 822 } } ] }
+  "health": "hit", "waitingForRequest": false,
+  "retryCount": 0, "lastError": null,
+  "lastUsage": { "cache_read_input_tokens": 822, "cache_creation_input_tokens": 0 } } ] }
 ```
+`health` 取值：`hit`（cache_read>0）/ `recreated`（read=0 但 cache_creation>0，已重建）/
+`no-cache`（2xx 但读写皆 0）/ `retrying`（临时错误抢救中）/ `waiting`（等真实请求）/
+`stale`（挂起）。
 
 ### B5 ping 引擎行为
 - 每个 key 一个定时器；触发时取该 key **最后一次非 ping 请求体**：
-  - `max_tokens` → `1`；`stream` → `false`；其余字段一律不动
+  - `max_tokens` → **固定 16**（2026-10-15 实测：max_tokens=1 不参与 Kimi 前缀缓存，
+    16 为已验证可命中的最低档；ping 输出整体丢弃）；其余字段一律不动
   - 追加标记：body 内 `metadata` 不改（前缀不变）；仅 sidecar 本地日志记 `[ping]`
-- 响应：丢弃正文，解析 usage 追加进 usage.jsonl（`"kind":"ping"` 字段）
-- **stale 判定**：连续 3 次 ping 的 `usage.cache_read_input_tokens == 0` → 挂起置 `stale=true`（缓存已冷，继续 ping 是白烧写量）；该 key 下次真实请求到达时自动清 stale 并恢复循环
-- 并发保护：该 key 的真实请求 lastSeen <10s 时本次重放顺延 30s
+- 响应：丢弃正文，解析 usage 追加进 usage.jsonl（`"kind":"ping"`，含
+  `model/latency_ms/result/retry` 与完整 usage 四字段：input/cache_read/cache_creation/output）
+- **结果三分类**（transport 错误与 cache miss 严格分开统计）：
+  - 2xx + `cache_read_input_tokens>0` → `hit`，失败计数清零
+  - 2xx + `cache_read=0` 且 `cache_creation_input_tokens>0` → `recreated`（旧 cache 失效但已重建，healthy），失败计数清零
+  - 2xx 且读写皆 0 → `no-cache`，计入 cache 失败计数；连续 3 次 → 挂起置 `stale`
+  - timeout/ECONNRESET/429/5xx → `retrying`，**不计入** cache 失败计数；
+    快速 retry：+2min 第一次、+4min 第二次（独立 setTimeout，**主 interval 不漂移**）；
+    成功即恢复 `hit/recreated`；retry 耗尽 → `stale`
+- 该 key 下次真实请求到达时自动清 stale/waiting 并恢复循环
+- 并发保护：该 key 的真实请求 lastSeen <10s 时本次重放顺延 30s（immediate ping 同样遵守）
 - ping 请求自身不得更新「最后真实请求体」
+- ping 上游超时默认 120s（env `PING_TIMEOUT_MS` 可配）
 
 ## Contract-C：dsh 插件清单
 

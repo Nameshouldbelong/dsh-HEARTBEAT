@@ -58,16 +58,66 @@ function extractUsage(txt) {
 // B1-B5 内存数据结构
 const sessions = new Map(); // key -> { key, lastSeenAt, model, lastStatus, lastInputTokens, lastCacheRead, lastSeenMs }
 const recordedRequests = new Map(); // key -> { body: Buffer, path: string, headers: object, model: string, lastSeenMs: number }
-const pings = new Map(); // key -> { key, on, intervalMin, lastPingAt, pingCount, stale, lastUsage, consecutiveZeroCacheRead }
-const pingTimers = new Map(); // key -> Timeout/Interval
+// key -> { key, on, intervalMin, lastPingAt, pingCount, stale, health, waitingForRequest,
+//          lastUsage, lastError, retryCount, retryTimer, consecutiveZeroCacheRead, consecutiveTransportFailures }
+const pings = new Map();
+const pingTimers = new Map(); // key -> Interval
+
+// 可测试配置（测试可直接改写字段注入短计时）
+const config = {
+  pingTimeoutMs: parseInt(process.env.PING_TIMEOUT_MS || '120000', 10), // ping 上游超时（原实现无超时，卡死会静默）
+  retryDelaysMs: [2 * 60 * 1000, 4 * 60 * 1000], // 临时错误快速抢救：+2min / +4min，不动主 interval
+  recencyWindowMs: 10000, // 真实请求 <10s 内
+  recencyDeferMs: 30000,  // 重放顺延 30s
+};
 
 function buildPingBody(recordedBuffer) {
   // 2026-10-15 实测(Kimi coding 端点): max_tokens=1 的请求不参与前缀缓存(连发双 miss),
-  // max_tokens=16/100/1024 均正常命中。故 ping 仅把 max_tokens 钳到 <=1024 封顶输出成本,
-  // 其余字段一律保持原样(含注入的 cache_control/user_id, 由记录时机保证已注入)。
+  // max_tokens=16/100/1024 均正常命中。ping 输出整体丢弃, 故固定 16(已验证可参与缓存的最低档),
+  // 不再沿用原始请求的 max_tokens 也不钳 1024。其余字段一律保持原样
+  // (含注入的 cache_control/user_id, 由记录时机保证已注入)。
   const j = JSON.parse(recordedBuffer.toString('utf8'));
-  if (typeof j.max_tokens === 'number') j.max_tokens = Math.min(j.max_tokens, 1024);
+  j.max_tokens = 16;
   return Buffer.from(JSON.stringify(j), 'utf8');
+}
+
+// ping 结果三分类：cache 命中 / cache 重建 / 无缓存(2xx 但读写皆 0) / 传输或 API 错误
+// HTTP/API 错误(429/5xx/timeout/ECONNRESET)绝不计入 cache 失败——两者分开统计
+function classifyPingResult(statusCode, usage) {
+  if (statusCode >= 200 && statusCode < 300) {
+    const read = Number((usage && usage.cache_read_input_tokens) || 0);
+    const creation = Number((usage && (usage.cache_creation_input_tokens || usage.cache_creation_tokens)) || 0);
+    if (read > 0) return 'hit';
+    if (creation > 0) return 'recreated';
+    return 'no-cache';
+  }
+  return 'error';
+}
+
+// 临时错误快速 retry：retry #1 +2min、retry #2 +4min(默认值见 config.retryDelaysMs)。
+// 用独立 setTimeout, 主 setInterval 周期不漂移; 成功即清零; 耗尽则置 stale 等真实流量复活。
+function scheduleRetry(key) {
+  const pingState = pings.get(key);
+  if (!pingState || !pingState.on) return;
+  const retry = (pingState.retryCount || 0) + 1;
+  if (retry > config.retryDelaysMs.length) {
+    pingState.retryCount = 0;
+    pingState.health = 'stale';
+    pingState.stale = true;
+    console.log(`[ping] key=${key} retries exhausted, marked stale`);
+    return;
+  }
+  pingState.retryCount = retry;
+  pingState.health = 'retrying';
+  const delayMs = config.retryDelaysMs[retry - 1];
+  if (pingState.retryTimer) clearTimeout(pingState.retryTimer);
+  const t = setTimeout(() => {
+    pingState.retryTimer = null;
+    runPing(key);
+  }, delayMs);
+  if (t.unref) t.unref();
+  pingState.retryTimer = t;
+  console.log(`[ping] key=${key} transport/API failure, retry #${retry} in ${Math.round(delayMs / 1000)}s`);
 }
 
 function runPing(key) {
@@ -77,9 +127,10 @@ function runPing(key) {
   if (!rec) return;
 
   // 并发保护：该 key 的真实请求 lastSeen <10s 时本次重放顺延 30s
+  // (immediate ping / retry / 周期 ping 一律遵守)
   const now = Date.now();
-  if (now - rec.lastSeenMs < 10000) {
-    const delayTimer = setTimeout(() => runPing(key), 30000);
+  if (now - rec.lastSeenMs < config.recencyWindowMs) {
+    const delayTimer = setTimeout(() => runPing(key), config.recencyDeferMs);
     if (delayTimer.unref) delayTimer.unref();
     return;
   }
@@ -107,6 +158,29 @@ function runPing(key) {
   delete headers.connection;
   delete headers['transfer-encoding'];
 
+  const startMs = Date.now();
+
+  // 传输/API 失败的统一处理：不计入 cache 失败计数，走快速 retry
+  const onTransportFailure = (statusCode, errStr) => {
+    pingState.lastPingAt = new Date().toISOString();
+    pingState.pingCount = (pingState.pingCount || 0) + 1;
+    pingState.consecutiveTransportFailures = (pingState.consecutiveTransportFailures || 0) + 1;
+    pingState.lastError = errStr;
+    log({
+      ts: new Date().toISOString(),
+      path: rec.path,
+      status: statusCode,
+      kind: 'ping',
+      key,
+      model: rec.model || 'unknown',
+      latency_ms: Date.now() - startMs,
+      result: 'error',
+      retry: pingState.retryCount || 0,
+      error: errStr,
+    });
+    scheduleRetry(key);
+  };
+
   const upReq = getUpstreamTransport().request(
     {
       hostname: getUpstreamHost(),
@@ -121,26 +195,41 @@ function runPing(key) {
       upRes.on('end', () => {
         const txt = Buffer.concat(respChunks).toString('utf8');
         const usage = extractUsage(txt);
+        const result = classifyPingResult(upRes.statusCode, usage);
+
+        if (result === 'error') {
+          // HTTP 429/5xx 等：transport/API 临时错误 -> retry，不算 cache miss
+          onTransportFailure(upRes.statusCode, 'http-' + upRes.statusCode);
+          return;
+        }
         log({
           ts: new Date().toISOString(),
           path: rec.path,
           status: upRes.statusCode,
           kind: 'ping',
           key,
+          model: rec.model || 'unknown',
+          latency_ms: Date.now() - startMs,
+          result,
+          retry: pingState.retryCount || 0,
           usage,
         });
-        console.log(`[ping] key=${key} status=${upRes.statusCode} cache_read=${usage.cache_read_input_tokens || 0}`);
+        console.log(`[ping] key=${key} status=${upRes.statusCode} result=${result} cache_read=${usage.cache_read_input_tokens || 0} cache_creation=${usage.cache_creation_input_tokens || 0}`);
         pingState.lastPingAt = new Date().toISOString();
         pingState.pingCount = (pingState.pingCount || 0) + 1;
         pingState.lastUsage = usage;
+        pingState.lastError = null;
+        pingState.health = result; // 'hit' | 'recreated' | 'no-cache'
+        pingState.consecutiveTransportFailures = 0;
+        pingState.retryCount = 0;
 
-        // stale 判定：连续 3 次 ping 的 usage.cache_read_input_tokens == 0 -> 挂起置 stale=true
-        const cacheRead = Number(usage.cache_read_input_tokens || 0);
-        if (cacheRead === 0) {
+        if (result === 'no-cache') {
+          // 2xx 但 cache 读写皆 0：才算一次 cache 失败；连续 3 次 -> 挂起置 stale
           pingState.consecutiveZeroCacheRead = (pingState.consecutiveZeroCacheRead || 0) + 1;
           if (pingState.consecutiveZeroCacheRead >= 3) {
             pingState.stale = true;
-            console.log(`[ping] key=${key} marked stale (3 consecutive zero cache read)`);
+            pingState.health = 'stale';
+            console.log(`[ping] key=${key} marked stale (3 consecutive pings without cache read/creation)`);
           }
         } else {
           pingState.consecutiveZeroCacheRead = 0;
@@ -149,15 +238,12 @@ function runPing(key) {
     }
   );
 
+  upReq.setTimeout(config.pingTimeoutMs, () => {
+    upReq.destroy(new Error('ping-timeout'));
+  });
+
   upReq.on('error', (e) => {
-    log({
-      ts: new Date().toISOString(),
-      path: rec.path,
-      status: 502,
-      kind: 'ping',
-      key,
-      error: String(e),
-    });
+    onTransportFailure(502, String(e && e.message ? e.message : e));
   });
 
   upReq.end(pingBody);
@@ -197,6 +283,10 @@ const server = http.createServer((req, res) => {
         lastPingAt: p.lastPingAt,
         pingCount: p.pingCount,
         stale: p.stale,
+        health: p.health || null,
+        waitingForRequest: p.waitingForRequest === true,
+        retryCount: p.retryCount || 0,
+        lastError: p.lastError || null,
         lastUsage: p.lastUsage,
       })),
     }));
@@ -229,8 +319,32 @@ const server = http.createServer((req, res) => {
         return;
       }
       if (!recordedRequests.has(key)) {
+        // 无已记录请求体（典型场景：sidecar 重启丢内存）：仍返回 409,
+        // 但记录保温意图——下一次真实请求到达时自动开始 ping 循环,
+        // 控制面据此显示 WAITING FOR REAL REQUEST 而非假 ACTIVE。
+        const prev = pings.get(key) || {};
+        pings.set(key, {
+          key,
+          on: true,
+          intervalMin,
+          lastPingAt: prev.lastPingAt || null,
+          pingCount: prev.pingCount || 0,
+          stale: false,
+          health: 'waiting',
+          waitingForRequest: true,
+          lastUsage: prev.lastUsage || null,
+          lastError: null,
+          retryCount: 0,
+          retryTimer: null,
+          consecutiveZeroCacheRead: 0,
+          consecutiveTransportFailures: 0,
+        });
         res.writeHead(409, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'no-request-recorded' }));
+        res.end(JSON.stringify({
+          error: 'no-request-recorded',
+          waiting: true,
+          state: { key, on: true, intervalMin, health: 'waiting', waitingForRequest: true },
+        }));
         return;
       }
 
@@ -239,6 +353,10 @@ const server = http.createServer((req, res) => {
         pingTimers.delete(key);
       }
       const existing = pings.get(key) || {};
+      if (existing.retryTimer) {
+        clearTimeout(existing.retryTimer);
+        existing.retryTimer = null;
+      }
       const state = {
         key,
         on: true,
@@ -246,17 +364,28 @@ const server = http.createServer((req, res) => {
         lastPingAt: existing.lastPingAt || null,
         pingCount: existing.pingCount || 0,
         stale: false,
+        health: existing.health === 'waiting' ? null : (existing.health || null),
+        waitingForRequest: false,
         lastUsage: existing.lastUsage || null,
+        lastError: null,
+        retryCount: 0,
+        retryTimer: null,
         consecutiveZeroCacheRead: 0,
+        consecutiveTransportFailures: 0,
       };
       pings.set(key, state);
       const timer = setInterval(() => runPing(key), intervalMin * 60 * 1000);
       if (timer.unref) timer.unref();
       pingTimers.set(key, timer);
 
+      // 开启即立即执行一次 ping（不等首个 interval），结果经 /control/state 轮询可见。
+      // runPing 内的 <10s 真实请求顺延 30s 保护对此同样生效。
+      setImmediate(() => runPing(key));
+
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
+        immediatePing: true,
         state: {
           key: state.key,
           on: state.on,
@@ -264,6 +393,8 @@ const server = http.createServer((req, res) => {
           lastPingAt: state.lastPingAt,
           pingCount: state.pingCount,
           stale: state.stale,
+          health: state.health,
+          waitingForRequest: state.waitingForRequest,
           lastUsage: state.lastUsage,
         },
       }));
@@ -286,7 +417,13 @@ const server = http.createServer((req, res) => {
         pingTimers.delete(key);
       }
       if (key && pings.has(key)) {
-        pings.get(key).on = false;
+        const p = pings.get(key);
+        p.on = false;
+        p.waitingForRequest = false;
+        if (p.retryTimer) {
+          clearTimeout(p.retryTimer);
+          p.retryTimer = null;
+        }
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
@@ -339,6 +476,14 @@ const server = http.createServer((req, res) => {
           // 若有活跃 ping 循环但处于 stale 状态，真实流量到达时自动清 stale 并恢复循环
           if (pings.has(currentKey)) {
             const p = pings.get(currentKey);
+            // waiting 状态（sidecar 重启后 /control/on 409 记录的保温意图）：
+            // 真实请求到达 -> 请求体已记录，立即恢复 ping 循环
+            const wasWaiting = p.waitingForRequest === true;
+            if (wasWaiting) {
+              p.waitingForRequest = false;
+              p.health = null;
+              console.log(`[ping] key=${currentKey} real request arrived, leaving waiting state`);
+            }
             if (p.stale) {
               p.stale = false;
               p.consecutiveZeroCacheRead = 0;
@@ -348,6 +493,8 @@ const server = http.createServer((req, res) => {
               const timer = setInterval(() => runPing(currentKey), p.intervalMin * 60 * 1000);
               if (timer.unref) timer.unref();
               pingTimers.set(currentKey, timer);
+              // waiting 恢复时立即 ping 一次确认 cache 状态（受 <10s 顺延 30s 保护约束）
+              if (wasWaiting) setImmediate(() => runPing(currentKey));
             }
           }
         }
@@ -412,10 +559,12 @@ module.exports = {
   affinityKey,
   extractUsage,
   buildPingBody,
+  classifyPingResult,
   runPing,
   sessions,
   recordedRequests,
   pings,
   pingTimers,
+  config,
   PORT,
 };

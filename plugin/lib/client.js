@@ -102,6 +102,16 @@ const styles = `
   color: #f59e0b;
   border: 1px solid rgba(245, 158, 11, 0.3);
 }
+.hb-badge-retrying {
+  background: rgba(249, 115, 22, 0.15);
+  color: #f97316;
+  border: 1px solid rgba(249, 115, 22, 0.3);
+}
+.hb-badge-waiting {
+  background: rgba(59, 130, 246, 0.15);
+  color: #3b82f6;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
 .hb-interval-wrap {
   display: flex;
   flex-direction: column;
@@ -291,7 +301,7 @@ function createHeartbeatClient(React) {
         }, loading ? '刷新中...' : '🔄 刷新状态')
       ),
       h('div', { className: 'hb-info-banner' },
-        '💡 说明：心跳仅重放该会话最后一次真实请求（max_tokens=1，stream=false），零会话污染、响应丢弃只取遥测。心跳间隔合法范围 1–720 分钟（默认 50min）。'
+        '💡 说明：心跳仅重放该会话最后一次真实请求（max_tokens=16，输出丢弃只取遥测），零会话污染。心跳间隔合法范围 1–720 分钟（默认 50min），开启后立即执行首次保温；临时错误（429/5xx/超时）自动 +2min/+4min 快速重试。'
       ),
       error ? h('div', { style: { color: '#ef4444', marginBottom: 12 } }, '状态加载异常：' + error) : null,
       sessions.length === 0
@@ -311,15 +321,34 @@ function createHeartbeatClient(React) {
                 const ping = pingsMap.get(s.key);
                 const isStale = ping?.stale === true;
                 const isOn = s.on === true;
+                const health = ping?.health || null;
+                const isWaiting = ping?.waitingForRequest === true || s.waiting === true;
                 let badgeClass = 'hb-badge-off';
                 let badgeText = '⚪ OFF';
 
-                if (isStale) {
-                  badgeClass = 'hb-badge-stale';
-                  badgeText = '🟡 STALE (已挂起)';
-                } else if (isOn) {
-                  badgeClass = 'hb-badge-on';
-                  badgeText = '🟢 ON (保温中)';
+                if (isOn || isWaiting) {
+                  if (isStale || health === 'stale') {
+                    badgeClass = 'hb-badge-stale';
+                    badgeText = '🟡 STALE (已挂起)';
+                  } else if (isWaiting || health === 'waiting') {
+                    badgeClass = 'hb-badge-waiting';
+                    badgeText = '🔵 WAITING FOR REAL REQUEST';
+                  } else if (health === 'retrying') {
+                    badgeClass = 'hb-badge-retrying';
+                    badgeText = `🟠 RETRYING (#${ping?.retryCount || 1})`;
+                  } else if (health === 'hit') {
+                    badgeClass = 'hb-badge-on';
+                    badgeText = '🟢 ACTIVE · HIT';
+                  } else if (health === 'recreated') {
+                    badgeClass = 'hb-badge-on';
+                    badgeText = '🟢 ACTIVE · RECREATED';
+                  } else if (health === 'no-cache') {
+                    badgeClass = 'hb-badge-stale';
+                    badgeText = '🟡 ON · NO-CACHE';
+                  } else {
+                    badgeClass = 'hb-badge-on';
+                    badgeText = '🟢 ON (保温中)';
+                  }
                 }
 
                 const currentVal = inputValues[s.sessionId] !== undefined ? inputValues[s.sessionId] : (s.intervalMin || 50);
@@ -327,7 +356,7 @@ function createHeartbeatClient(React) {
 
                 return h('tr', { key: s.sessionId },
                   h('td', null,
-                    h('div', { style: { fontWeight: 600 } }, s.title || s.sessionId),
+                    h('div', { style: { fontWeight: 600 } }, s.title || `Session ${String(s.sessionId).replace(/^session-/, '').slice(0, 8)}…`),
                     h('div', { className: 'hb-mono', style: { color: 'var(--dsh-text-muted, #9ca3af)', marginTop: 2 } }, s.key)
                   ),
                   h('td', null,
@@ -362,10 +391,13 @@ function createHeartbeatClient(React) {
                   ),
                   h('td', null,
                     h('div', { className: 'hb-mono', style: { fontSize: 11 } },
-                      '时间: ' + (ping?.lastPingAt ? new Date(ping.lastPingAt).toLocaleTimeString() : '无')
+                      'Last HB: ' + (ping?.lastPingAt ? new Date(ping.lastPingAt).toLocaleTimeString() : '无')
                     ),
                     h('div', { className: 'hb-mono', style: { fontSize: 11, color: 'var(--dsh-text-muted, #9ca3af)' } },
-                      `次数: ${ping?.pingCount || 0} | 命中: ${ping?.lastUsage?.cache_read_input_tokens || 0}`
+                      `次数: ${ping?.pingCount || 0} | Cache read: ${ping?.lastUsage?.cache_read_input_tokens || 0}`
+                    ),
+                    h('div', { className: 'hb-mono', style: { fontSize: 11, color: 'var(--dsh-text-muted, #9ca3af)' } },
+                      `Cache creation: ${ping?.lastUsage?.cache_creation_input_tokens || 0}` + (ping?.lastError ? ` | 错误: ${ping.lastError}` : '')
                     )
                   )
                 );

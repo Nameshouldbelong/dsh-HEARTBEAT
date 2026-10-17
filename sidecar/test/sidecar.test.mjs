@@ -37,13 +37,34 @@ test('extractUsage: 正确提取使用量信息', () => {
   assert.equal(usage.output_tokens, 25);
 });
 
-test('B5: buildPingBody 原样重放(不改写 max_tokens/stream, Kimi 缓存只认原请求)', () => {
-  const recorded = Buffer.from(JSON.stringify({ model: 'k3', max_tokens: 1024, stream: undefined, system: 'S', messages: [] }));
+test('B5: buildPingBody 固定 max_tokens=16（2026-10-15 实测：max_tokens=1 不参与前缀缓存，16 为已验证最低档；ping 输出整体丢弃），其余字段原样', () => {
+  const recorded = Buffer.from(JSON.stringify({ model: 'k3', max_tokens: 1024, stream: undefined, system: 'S', messages: [{ role: 'user', content: 'x' }], tools: [{ name: 't' }] }));
   const out = JSON.parse(sidecar.buildPingBody(recorded).toString('utf8'));
-  assert.equal(out.max_tokens, 1024);
+  assert.equal(out.max_tokens, 16);
   assert.equal(out.system, 'S');
-  const big = JSON.parse(sidecar.buildPingBody(Buffer.from(JSON.stringify({ max_tokens: 4096 }))).toString('utf8'));
-  assert.equal(big.max_tokens, 1024);
+  assert.deepEqual(out.messages, [{ role: 'user', content: 'x' }]);
+  assert.deepEqual(out.tools, [{ name: 't' }]);
+  // 原始值更大也固定为 16，不再 clamp 到 1024
+  const big = JSON.parse(sidecar.buildPingBody(Buffer.from(JSON.stringify({ max_tokens: 32768 }))).toString('utf8'));
+  assert.equal(big.max_tokens, 16);
+  // 原请求缺 max_tokens 时补 16（max_tokens=1 的隐式默认同样不可参与缓存）
+  const none = JSON.parse(sidecar.buildPingBody(Buffer.from(JSON.stringify({ model: 'k3' }))).toString('utf8'));
+  assert.equal(none.max_tokens, 16);
+});
+
+test('P0-4: classifyPingResult 三分类（hit / recreated / no-cache / error）', () => {
+  // T3: cache hit 判 healthy
+  assert.equal(sidecar.classifyPingResult(200, { cache_read_input_tokens: 100000, cache_creation_input_tokens: 0 }), 'hit');
+  // T4: cache 重建（read=0 但 creation>0）判 healthy
+  assert.equal(sidecar.classifyPingResult(200, { cache_read_input_tokens: 0, cache_creation_input_tokens: 100000 }), 'recreated');
+  assert.equal(sidecar.classifyPingResult(200, { cache_creation_tokens: 5000 }), 'recreated'); // 兼容字段名
+  // 2xx 但读写皆 0
+  assert.equal(sidecar.classifyPingResult(200, { cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }), 'no-cache');
+  assert.equal(sidecar.classifyPingResult(200, {}), 'no-cache');
+  // T5: HTTP 429/5xx 是 transport/API 错误，不是 cache miss
+  assert.equal(sidecar.classifyPingResult(429, {}), 'error');
+  assert.equal(sidecar.classifyPingResult(500, { cache_read_input_tokens: 0 }), 'error');
+  assert.equal(sidecar.classifyPingResult(503, {}), 'error');
 });
 
 test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /control/state', async (t) => {
@@ -123,7 +144,7 @@ test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /contro
   assert.equal(sessRes1.status, 200);
   assert.ok(Array.isArray(sessRes1.json.sessions));
 
-  // 3. POST /control/on 对未记录请求的 key 返回 409 no-request-recorded
+  // 3. POST /control/on 对未记录请求的 key 返回 409 no-request-recorded + waiting 意图
   const onFailRes = await request('/control/on', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -131,6 +152,13 @@ test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /contro
   });
   assert.equal(onFailRes.status, 409);
   assert.equal(onFailRes.json.error, 'no-request-recorded');
+  assert.equal(onFailRes.json.waiting, true);
+  // 清理 waiting 意图，避免影响后续测试
+  await request('/control/off', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: 'dshsc-unknown999' }),
+  });
 
   // 4. POST /control/on 参数校验 (非法间隔)
   const onInvalidRes = await request('/control/on', {
@@ -179,6 +207,7 @@ test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /contro
   });
   assert.equal(onOkRes.status, 200);
   assert.equal(onOkRes.json.ok, true);
+  assert.equal(onOkRes.json.immediatePing, true); // 开启即立即 ping（受 <10s 顺延保护）
   assert.equal(onOkRes.json.state.key, recordedKey);
   assert.equal(onOkRes.json.state.on, true);
   assert.equal(onOkRes.json.state.intervalMin, 30);
@@ -207,10 +236,7 @@ test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /contro
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.ok(lastUpstreamReq);
   const pingBodyReceived = JSON.parse(lastUpstreamReq.body);
-  assert.ok(
-    pingBodyReceived.max_tokens === undefined || pingBodyReceived.max_tokens <= 1024,
-    'ping max_tokens must be absent or <=1024 (Kimi excludes max_tokens=1 from cache)'
-  );
+  assert.equal(pingBodyReceived.max_tokens, 16, 'ping max_tokens 固定为 16（Kimi 实测 max_tokens=1 不参与缓存）');
   assert.equal(pingBodyReceived.stream, undefined); // stream 保持原样(未改写)
 
   // 再次获取 state，验证 ping 计数与使用量已更新
@@ -294,4 +320,198 @@ test('B5: stale 判定（连续 3 次 cache_read == 0 置 stale=true）与真实
   pingState.consecutiveZeroCacheRead = 0;
   assert.equal(pingState.stale, false);
   assert.equal(pingState.consecutiveZeroCacheRead, 0);
+});
+
+test('P0 集成: immediate ping / max_tokens=16 / 429 快速 retry / waiting 自动恢复', async (t) => {
+  // 可编程 mock 上游
+  let responder = () => ({
+    status: 200,
+    json: { id: 'msg-mock', type: 'message', usage: { input_tokens: 500, cache_read_input_tokens: 450, cache_creation_input_tokens: 0, output_tokens: 16 } },
+  });
+  let lastUpstreamReq = null;
+  const mockUpstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      lastUpstreamReq = { url: req.url, method: req.method, body: Buffer.concat(chunks).toString('utf8') };
+      const r = responder(req, lastUpstreamReq.body);
+      res.writeHead(r.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(r.json));
+    });
+  });
+  await new Promise((resolve) => mockUpstream.listen(0, '127.0.0.1', resolve));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+
+  await new Promise((resolve) => sidecar.server.listen(0, '127.0.0.1', resolve));
+  const sidecarPort = sidecar.server.address().port;
+
+  // 注入短计时：retry +30ms/+60ms；禁用 10s 顺延保护
+  const savedConfig = { ...sidecar.config };
+  sidecar.config.retryDelaysMs = [30, 60];
+  sidecar.config.recencyWindowMs = 0;
+
+  t.after(() => {
+    Object.assign(sidecar.config, savedConfig);
+    mockUpstream.close();
+    sidecar.server.close();
+  });
+
+  const request = (path, options = {}) => new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: '127.0.0.1', port: sidecarPort, path, method: options.method || 'GET', headers: options.headers || {} },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          try { resolve({ status: res.statusCode, json: JSON.parse(body) }); }
+          catch { resolve({ status: res.statusCode, text: body }); }
+        });
+      }
+    );
+    req.on('error', reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+
+  const waitFor = async (fn, timeoutMs = 3000, step = 20) => {
+    const start = Date.now();
+    for (;;) {
+      const v = await fn();
+      if (v) return v;
+      if (Date.now() - start > timeoutMs) return null;
+      await new Promise((r) => setTimeout(r, step));
+    }
+  };
+  const pingStateOf = async (key) => {
+    const r = await request('/control/state');
+    return r.json.pings.find((x) => x.key === key) || null;
+  };
+
+  // --- Test 1: /control/on 后立即执行一次 ping（不等 50min interval）
+  const keyT1 = 'test-key-immediate';
+  sidecar.recordedRequests.set(keyT1, {
+    body: Buffer.from(JSON.stringify({
+      model: 'k3',
+      system: 'S-immediate',
+      max_tokens: 32768,
+      messages: [{ role: 'user', content: 'hello' }],
+    })),
+    path: '/v1/messages',
+    headers: {},
+    model: 'k3',
+    lastSeenMs: 0,
+  });
+  const onRes = await request('/control/on', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: keyT1, intervalMin: 50 }),
+  });
+  assert.equal(onRes.status, 200);
+  assert.equal(onRes.json.immediatePing, true);
+
+  const st1 = await waitFor(async () => {
+    const p = await pingStateOf(keyT1);
+    return p && p.pingCount >= 1 ? p : null;
+  });
+  assert.ok(st1, 'immediate ping 应在不等待 interval 的情况下完成');
+  assert.ok(st1.lastPingAt, 'lastPingAt 应立即非空');
+  assert.equal(st1.health, 'hit');
+  assert.equal(st1.intervalMin, 50, '主 interval 仍为 50min');
+
+  // --- Test 2: replay body max_tokens 固定 16，关键前缀字段不变
+  assert.ok(lastUpstreamReq, 'immediate ping 应已到达上游');
+  const pingReq = JSON.parse(lastUpstreamReq.body);
+  assert.equal(pingReq.max_tokens, 16);
+  assert.equal(pingReq.system, 'S-immediate');
+  assert.deepEqual(pingReq.messages, [{ role: 'user', content: 'hello' }]);
+  assert.deepEqual(pingReq.cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.equal(pingReq.metadata.user_id, keyT1);
+
+  // --- Test 5: HTTP 429 = transport/API 错误 -> 进入 retry，不计入 cache 失败
+  responder = () => ({ status: 429, json: { error: { type: 'rate_limit' } } });
+  sidecar.runPing(keyT1);
+  const stRetry = await waitFor(async () => {
+    const p = await pingStateOf(keyT1);
+    return p && p.health === 'retrying' ? p : null;
+  });
+  assert.ok(stRetry, '429 后应进入 retrying');
+  assert.equal(stRetry.retryCount, 1);
+  const rawT1 = sidecar.pings.get(keyT1);
+  assert.equal(rawT1.consecutiveZeroCacheRead, 0, '429 不得计入 cache-zero 失败计数');
+  assert.equal(rawT1.consecutiveTransportFailures, 1);
+
+  // --- Test 6: retry 成功 -> 恢复 hit，非 stale，retry 计数清零
+  responder = () => ({ status: 200, json: { id: 'm', type: 'message', usage: { input_tokens: 500, cache_read_input_tokens: 460, cache_creation_input_tokens: 0, output_tokens: 16 } } });
+  const stHit = await waitFor(async () => {
+    const p = await pingStateOf(keyT1);
+    return p && p.health === 'hit' && p.retryCount === 0 ? p : null;
+  });
+  assert.ok(stHit, 'retry 成功应恢复 ACTIVE(hit)');
+  assert.equal(stHit.stale, false);
+  await request('/control/off', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: keyT1 }),
+  });
+
+  // --- 第八章: /control/on 无请求记录 -> 409 waiting；真实请求到达后自动恢复保温
+  const keyW = 'test-key-waiting';
+  const onW = await request('/control/on', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: keyW, intervalMin: 50 }),
+  });
+  assert.equal(onW.status, 409);
+  assert.equal(onW.json.error, 'no-request-recorded');
+  assert.equal(onW.json.waiting, true);
+  const pW1 = await pingStateOf(keyW);
+  assert.equal(pW1.waitingForRequest, true);
+  assert.equal(pW1.health, 'waiting');
+  assert.equal(pW1.on, true);
+
+  // 真实请求（客户端自带 metadata.user_id=keyW）经 sidecar 转发到达
+  const realW = await request('/v1/messages', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'k3', system: 'S-waiting', messages: [{ role: 'user', content: 'real' }], metadata: { user_id: keyW } }),
+  });
+  assert.equal(realW.status, 200);
+
+  const pW2 = await waitFor(async () => {
+    const p = await pingStateOf(keyW);
+    return p && p.waitingForRequest === false && p.pingCount >= 1 ? p : null;
+  });
+  assert.ok(pW2, '真实请求到达后应自动退出 waiting 并立即完成首次 ping');
+  assert.equal(pW2.health, 'hit');
+  await request('/control/off', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: keyW }),
+  });
+});
+
+test('T9 [KNOWN-ISSUE]: 双会话同 system -> affinity key 碰撞（显式记录当前缺陷，DSH core 注入 session 级 user_id 后应反转）', () => {
+  // 生产实证（2026-10-17）：DSH request/header 无 metadata 字段，sidecar 全部走
+  // sha256(system[:8000]) 合成键。两个 system 相同的会话得到相同 key，
+  // recordedRequests 相互覆盖 -> heartbeat 可能 replay 错会话的请求体。
+  // 本测试用于暴露并记录该问题（docs/KNOWN-ISSUES.md），而不是隐藏它。
+  const sharedSystem = 'shared system prompt across sessions';
+  const sessA = sidecar.affinityKey({ system: sharedSystem, messages: [{ role: 'user', content: 'A-marker' }] });
+  const sessB = sidecar.affinityKey({ system: sharedSystem, messages: [{ role: 'user', content: 'B-marker' }] });
+  assert.equal(sessA.synthesized, true);
+  assert.equal(sessB.synthesized, true);
+  assert.equal(sessA.id, sessB.id, 'KNOWN-ISSUE: 当前同 system 双会话得到相同 key（碰撞）');
+
+  sidecar.recordedRequests.set(sessA.id, { body: Buffer.from('A-marker'), path: '/v1/messages', headers: {}, model: 'k3', lastSeenMs: 1 });
+  sidecar.recordedRequests.set(sessB.id, { body: Buffer.from('B-marker'), path: '/v1/messages', headers: {}, model: 'k3', lastSeenMs: 2 });
+  assert.equal(
+    sidecar.recordedRequests.get(sessA.id).body.toString(),
+    'B-marker',
+    'KNOWN-ISSUE: B 的最后请求体覆盖了 A'
+  );
+  sidecar.recordedRequests.delete(sessA.id);
 });

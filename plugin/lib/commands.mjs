@@ -49,17 +49,22 @@ export async function executeHton(sessionId, statePath) {
   const intervalMin = current?.intervalMin || 50;
   const key = await resolveSessionKey(sessionId, statePath);
 
-  updateSessionState(statePath, sessionId, {
-    key,
-    on: true,
-    intervalMin,
-  });
+  const res = await sidecarControlOn(key, intervalMin).catch(() => null);
 
-  try {
-    await sidecarControlOn(key, intervalMin);
-  } catch {}
+  // sidecar 无该 key 的请求记录（典型：sidecar 重启丢内存）：
+  // sidecar 已记录保温意图，真实请求到达会自动开始 —— 如实告知，不假装 ACTIVE
+  if (res && res.status === 409) {
+    updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: true });
+    return `💓 心跳意图已记录（间隔 ${intervalMin}min）：sidecar 暂无本会话请求记录，下一次真实请求到达后自动开始保温`;
+  }
 
-  return `💓 心跳已开启（间隔 ${intervalMin}min）`;
+  updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: false });
+
+  if (!res || res.status !== 200) {
+    return `⚠️ sidecar 未响应（已记录开启意图，reconciler 每分钟自动补挂，间隔 ${intervalMin}min）`;
+  }
+
+  return `💓 心跳已开启（间隔 ${intervalMin}min），已立即执行首次保温`;
 }
 
 export async function executeHtoff(sessionId, statePath) {
@@ -87,17 +92,21 @@ export async function executeHto(arg, sessionId, statePath) {
   const intervalMin = parsed.minutes;
   const key = await resolveSessionKey(sessionId, statePath);
 
-  updateSessionState(statePath, sessionId, {
-    key,
-    on: true,
-    intervalMin,
-  });
+  const res = await sidecarControlOn(key, intervalMin).catch(() => null);
 
-  try {
-    await sidecarControlOn(key, intervalMin);
-  } catch {}
+  let receipt;
+  if (res && res.status === 409) {
+    updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: true });
+    receipt = `💓 心跳间隔已设为 ${intervalMin}min：sidecar 暂无本会话请求记录，下一次真实请求到达后自动开始保温`;
+  } else {
+    updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: false });
+    if (!res || res.status !== 200) {
+      receipt = `⚠️ sidecar 未响应（已记录开启意图，reconciler 每分钟自动补挂，间隔 ${intervalMin}min）`;
+    } else {
+      receipt = `💓 心跳间隔已设为 ${intervalMin}min 并开启，已立即执行首次保温`;
+    }
+  }
 
-  let receipt = `💓 心跳间隔已设为 ${intervalMin}min 并开启`;
   if (intervalMin >= 60) {
     receipt += '\n⚠️ 间隔≥60min：1h TTL 缓存会在 ping 间过期';
   }
