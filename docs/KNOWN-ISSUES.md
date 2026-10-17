@@ -46,3 +46,13 @@ sidecar 新鲜流量（<10min recency）重解析 key 并重试一次（`rotateS
 waiting（避免给错误会话保温）。首次解析出的 key 409（真无流量）仍走
 waiting 语义不变。根治 key 漂移本身仍依赖 KI-1（DSH core 注入稳定
 session 级 metadata.user_id）。
+
+## KI-4：/heartbeat/api/state 每次请求 8-9s（大日志会话 title 读取慢）
+
+`readSessionTitles` 每次都调 `readTitleSnapshots`（无缓存，保证 Rename
+即时同步），对超大 会话 日志（100k+ token 会话，几十 MB zstd）单次
+折叠读取需 8-9s。会话越多 UI 轮询越慢。
+
+**候选优化（未做）**：30s 微缓存（rename 同步延迟容忍 30s）或仅对
+heartbeat 开启中的会话读标题。因与「不缓存、rename 即时同步」的
+设计约定冲突，留待用户裁定。
