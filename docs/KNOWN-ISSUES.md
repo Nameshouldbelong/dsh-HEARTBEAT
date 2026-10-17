@@ -32,14 +32,17 @@ sidecar Contract-A 已原样沿用客户端提供的 `metadata.user_id`，无需
 0600 权限、session 删除时清除、明确 retention、禁入普通 debug log。
 如确需要求，另开任务评估。
 
-## KI-3：插件存储的 key 随 system prompt 漂移而卡死（本轮暴露）
+## KI-3：插件存储的 key 随 system prompt 漂移而卡死（✅ 已修复，2026-10-17）
 
 `dshsc-` key = sha256(system[:8000])。会话的 system prompt 内容变化
 （如注入的记忆/上下文更新）后，同一 DSH 会话的 key 改变，而插件 state 里
 存的是旧 key：`/control/on` 409 → `waitingForRequest`，但旧 key 的请求
 永远不会再来 → waiting 卡死。
 
-**临时处置**：删 state.json 中该会话的 `key` 字段后重新 toggle（触发
-recency 重解析）。**后续修复方向**：reconciler 检测 waiting 超时
-（如 >10min）自动清 key 重解析；根治仍依赖 KI-1（DSH core 注入稳定
+**修复（本轮已实现）**：`/control/on` 对存储 key 返回 409 时，自动按
+sidecar 新鲜流量（<10min recency）重解析 key 并重试一次（`rotateStaleKey`，
+命令路径与 reconciler 每分钟对账均生效）；轮换成功即解除 waiting 并更新
+存储 key。**防抢守卫**：新 key 若已被其他开启中的会话认领，不抢占、保持
+waiting（避免给错误会话保温）。首次解析出的 key 409（真无流量）仍走
+waiting 语义不变。根治 key 漂移本身仍依赖 KI-1（DSH core 注入稳定
 session 级 metadata.user_id）。
