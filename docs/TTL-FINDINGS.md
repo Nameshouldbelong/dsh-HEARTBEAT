@@ -45,3 +45,21 @@ systemd-run --user --unit=ttl-verify --property=KillMode=process --no-block \
 ```
 
 原始数据：`docs/verify-ttl-2026-10-20.json`、`docs/verify-ttl-45min-2026-10-20.json`。
+
+---
+
+## ⚠️ 重要澄清：长 TTL 并未被证实"正确发放"（2026-10-20 补记）
+
+"字段送达"不等于"长 TTL 生效"。已证实的只有：
+
+1. `prompt_cache_options:{mode:'implicit',ttl:'1h'}` **被端点正常接受**（无报错）——
+   A/B 实验（mock 上游抓包）证明字段字节正确送达上游；
+2. **实际缓存寿命 ≈ 40 分钟**，不是 1 小时——两组对照实验（sidecar 注入 /
+   客户端自带）在 39.7min 与 42.6min 均 MISS。
+
+因此准确表述是：**TTL 参数链路（DSH → sidecar → 上游）已打通且被接受，
+但 1h 档位的实际寿命未被端点实现**。30min 默认间隔是基于实测寿命而非名义 TTL
+选定的，这一点已被 5 组实验共同支撑（间隔 <40min 时 18/18 全命中）。
+
+若未来 Kimi 真正实现 1h，或用户体感缓存明显更长，只需把默认间隔调大即可，
+无需改架构。这是保留 `intervalMin` 可配置的原因。
