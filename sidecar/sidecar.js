@@ -128,8 +128,11 @@ const config = {
   priceCacheReadPerM: parseFloat(process.env.PRICE_CACHE_READ_PER_M || '0.3'),
   // ② 连续 transport 失败急停（401/403 立即停，其余累计到阈值）
   transportFailLimit: parseInt(process.env.TRANSPORT_FAIL_LIMIT || '3', 10),
-  // ③ 空闲截断：距最后一次真实请求超过该分钟数 -> 停止探测（0=不设限）
-  maxIdleMin: parseInt(process.env.MAX_IDLE_MIN || '30', 10),
+  // ③ 空闲截断：距最后一次真实请求超过该分钟数 -> 停止探测（0=不设限）。
+  //    必须远大于心跳间隔（默认 30min），否则第一次周期 ping 就踩中上限、
+  //    保温被自己的护栏杀死（2026-10-20 E2E 实测踩中：30min 间隔 + 30min 上限
+  //    → 30min 后的周期 ping 恰好 idle=30min 被 AUTO-OFF）。默认取间隔的 3 倍。
+  maxIdleMin: parseInt(process.env.MAX_IDLE_MIN || '90', 10),
 };
 
 // 估算单次 ping 的花费（USD）。usage 里 cached 部分是命中价，其余未命中按 input 价。
