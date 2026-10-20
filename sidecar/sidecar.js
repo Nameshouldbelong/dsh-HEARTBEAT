@@ -368,6 +368,36 @@ const server = http.createServer((req, res) => {
         return;
       }
 
+      // 幂等短路（2026-10-20 生产事故修复）：reconciler 每分钟对所有 on 会话
+      // 补挂 /control/on。旧实现每次调用都 clearInterval + 清空 retryTimer +
+      // setImmediate(runPing) —— 导致每个 on 的 key 每分钟白 ping 一次
+      // （实测 45min 内 pingCount=48，烧 cache-read quota），且 P0-2 的
+      // +2/+4min 快速 retry 定时器每分钟被清空、retryCount 归零，retry 机制
+      // 在生产实际失效。已健康运行的 key（on + 同间隔 + 定时器在 + 非 stale/
+      // waiting）一律视为 no-op，直接返回现状。
+      const cur = pings.get(key);
+      if (cur && cur.on && cur.intervalMin === intervalMin && pingTimers.has(key)
+          && !cur.stale && !cur.waitingForRequest) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          alreadyOn: true,
+          immediatePing: false,
+          state: {
+            key: cur.key,
+            on: cur.on,
+            intervalMin: cur.intervalMin,
+            lastPingAt: cur.lastPingAt,
+            pingCount: cur.pingCount,
+            stale: cur.stale,
+            health: cur.health,
+            waitingForRequest: cur.waitingForRequest,
+            lastUsage: cur.lastUsage,
+          },
+        }));
+        return;
+      }
+
       if (pingTimers.has(key)) {
         clearInterval(pingTimers.get(key));
         pingTimers.delete(key);

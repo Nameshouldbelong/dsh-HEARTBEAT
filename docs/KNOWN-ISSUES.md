@@ -56,3 +56,20 @@ session 级 metadata.user_id）。
 **候选优化（未做）**：30s 微缓存（rename 同步延迟容忍 30s）或仅对
 heartbeat 开启中的会话读标题。因与「不缓存、rename 即时同步」的
 设计约定冲突，留待用户裁定。
+
+## KI-5：reconciler 每分钟补挂与 immediate-ping 叠加 → 白 ping + retry 失效（✅ 已修复，2026-10-20）
+
+**根因**：`/control/on` 非幂等——每次调用都 clearInterval 重装定时器、
+清空 retryTimer/retryCount、并 `setImmediate(runPing)`。插件 reconciler
+每分钟对所有 on 会话补挂一次 → 每个 on 的 key **每分钟白 ping 一次**
+（实测 45min pingCount=48，按会话前缀规模烧 cache-read quota），且
+P0-2 的 +2/+4min 快速 retry 定时器每分钟被清空，retry 机制生产失效
+（UI 呈现 health=retrying 但 retryCount=0 的矛盾态）。
+
+**修复**：`/control/on` 幂等短路——已 on + 同间隔 + 定时器存活 + 非
+stale/waiting → 返回 `alreadyOn:true, immediatePing:false`，不动任何
+状态。间隔变更/显式重开/stale/waiting 仍走完整重置路径。
+回归测试：`P0 回归: /control/on 幂等`（sidecar 11/11）。
+
+**生产验证**：修复部署后本会话 key 经 KI-3 轮换自愈（e638b59e，
+cache_read=270k，hit），无每分钟白 ping。
