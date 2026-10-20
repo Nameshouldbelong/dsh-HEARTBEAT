@@ -119,3 +119,24 @@ cache_read=270k，hit），无每分钟白 ping。
 `spentUsd`，UI 遥测行显示「花费≈$x.xxxx」。
 
 测试：sidecar 17/17（新增花费上限/403 急停/空闲截断 3 项）+ plugin 14/14。
+
+## KI-8：HB tab 混入孤儿 subagent 与已归档会话（✅ 已修复，2026-10-20）
+
+**现象**：tab 显示 36 个会话，含 5 个 LMCHK 子代理孤儿会话（裸 UUID，父会话已亡）。
+
+**根因**（探索自 `dsh-client-ui-workspace/lib/client.js:356` 的 `sessionVisible`）：
+GUI 侧栏有三条过滤规则，而 tab 一条都没实现——
+1. `origin === 'subagent'` 的会话永不在侧栏顶层显示；
+2. `blank` 未启动会话不显示；
+3. 默认视图排除 `workspaceRegistry.archivedSessionIds`。
+且 `/heartbeat/api/state` 无条件遍历 `state.sessions`，历史遗留项（已归档/已删除/孤儿）
+只要曾写入 state.json 就会一直被返回。
+
+**修复**：
+- `reconciler.mjs` 的 `getActiveSessionIds`：归档集合兼容 Array/Set/可迭代 + 磁盘
+  `workspace.json` 兜底；识别并排除孤儿 subagent（`origin==='subagent'` 且父会话不在
+  根活跃集合）；`extractSessionInfo` 兼容 header 与扁平两种形态（0.1.7/0.2.1 差异防御）。
+- `index.mjs` 的 `/heartbeat/api/state`：仅当 `activeIds.has(id)` 才载入 state 记录。
+- 动态挂载：服务端每请求重算、无缓存，取消归档后下一次客户端轮询（5s）自动重现。
+
+**验证**：生产 tab 36 → 31，5 个孤儿会话全部消失；单测 18/18（含新增 4 项可见性）。

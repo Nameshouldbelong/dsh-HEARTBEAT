@@ -5,15 +5,45 @@ import { readState, removeSessionState, updateSessionState } from './state.mjs';
 import { sidecarControlOn, sidecarControlOff } from './sidecar-client.mjs';
 import { rotateStaleKey } from './commands.mjs';
 
+function extractSessionInfo(record) {
+  if (!record || typeof record !== 'object') return null;
+  const header = record.header && typeof record.header === 'object' ? record.header : null;
+  const id = header?.id || record.id || record.sessionId;
+  if (!id || typeof id !== 'string') return null;
+  const origin = header?.origin ?? record.origin;
+  const parentId = header?.parentSession ?? header?.parentSessionId ?? record.parentSession ?? record.parentSessionId;
+  return { id, origin, parentId };
+}
+
 export async function getActiveSessionIds(ctx) {
   // 1. 尝试从 cordis 注入的 sessionQuery / workspaceRegistry 读取
   const archived = new Set();
   try {
     const list = ctx?.workspaceRegistry?.archivedSessionIds;
-    if (Array.isArray(list)) {
+    if (Array.isArray(list) || list instanceof Set) {
+      for (const id of list) archived.add(id);
+    } else if (list && typeof list[Symbol.iterator] === 'function') {
       for (const id of list) archived.add(id);
     }
   } catch {}
+
+  const base = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
+    ? process.env.DSH_HOME
+    : path.join(os.homedir(), '.dsh');
+
+  // 若从 ctx 读取的 archived 为空，尝试从 storages/workspace.json 兜底读取
+  if (archived.size === 0) {
+    try {
+      const wsJsonPath = path.join(base, 'storages', 'workspace.json');
+      if (fs.existsSync(wsJsonPath)) {
+        const wsData = JSON.parse(fs.readFileSync(wsJsonPath, 'utf8'));
+        const list = wsData?.global?.archivedSessionIds;
+        if (Array.isArray(list)) {
+          for (const id of list) archived.add(id);
+        }
+      }
+    } catch {}
+  }
 
   const activeIds = new Set();
   let gotFromCtx = false;
@@ -22,11 +52,32 @@ export async function getActiveSessionIds(ctx) {
     if (ctx?.sessionQuery && typeof ctx.sessionQuery.listSessions === 'function') {
       const records = await ctx.sessionQuery.listSessions();
       if (Array.isArray(records)) {
+        const parsed = [];
+        const candidateIds = new Set();
         for (const r of records) {
-          const id = r.header?.id || r.id;
-          if (id && !archived.has(id)) {
-            activeIds.add(id);
+          const info = extractSessionInfo(r);
+          if (info && !archived.has(info.id)) {
+            parsed.push(info);
+            candidateIds.add(info.id);
           }
+        }
+
+        // 根活跃会话（非 subagent 且未归档）
+        const rootActiveIds = new Set();
+        for (const info of parsed) {
+          if (info.origin !== 'subagent') {
+            rootActiveIds.add(info.id);
+          }
+        }
+
+        // 孤儿 subagent 会话过滤：origin === 'subagent' 且 parent 不在活跃集合中予以排除
+        for (const info of parsed) {
+          if (info.origin === 'subagent') {
+            if (!info.parentId || !rootActiveIds.has(info.parentId)) {
+              continue;
+            }
+          }
+          activeIds.add(info.id);
         }
         gotFromCtx = true;
       }
@@ -36,9 +87,6 @@ export async function getActiveSessionIds(ctx) {
   if (gotFromCtx) return activeIds;
 
   // 2. 备用方案：扫描 ~/.dsh/sessions/ 目录与 storages
-  const base = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
-    ? process.env.DSH_HOME
-    : path.join(os.homedir(), '.dsh');
   const sessionsDir = path.join(base, 'sessions');
 
   try {
