@@ -241,7 +241,7 @@ function createHeartbeatClient(React) {
           body: JSON.stringify({
             sessionId,
             on: nextOn,
-            intervalMin: Number(inputValues[sessionId] || currentInterval || 50),
+            intervalMin: Number(inputValues[sessionId] || currentInterval || 45),
           }),
         });
         await fetchState();
