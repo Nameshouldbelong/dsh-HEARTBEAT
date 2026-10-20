@@ -448,7 +448,7 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'invalid-key' }));
         return;
       }
-      let intervalMin = body.intervalMin !== undefined ? Number(body.intervalMin) : 45;
+      let intervalMin = body.intervalMin !== undefined ? Number(body.intervalMin) : 30;
       if (!Number.isInteger(intervalMin) || intervalMin < 1 || intervalMin > 720) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'invalid-interval' }));

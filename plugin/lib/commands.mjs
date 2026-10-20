@@ -74,7 +74,7 @@ export async function rotateStaleKey(sessionId, statePath, oldKey, intervalMin) 
 export async function executeHton(sessionId, statePath) {
   const state = readState(statePath);
   const current = state.sessions[sessionId];
-  const intervalMin = current?.intervalMin || 45;
+  const intervalMin = current?.intervalMin || 30;
   const key = await resolveSessionKey(sessionId, statePath);
 
   const res = await sidecarControlOn(key, intervalMin).catch(() => null);

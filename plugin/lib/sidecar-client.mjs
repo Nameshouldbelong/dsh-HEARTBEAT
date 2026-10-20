@@ -55,7 +55,7 @@ export async function sidecarControlState() {
   return res.status === 200 && Array.isArray(res.data?.pings) ? res.data.pings : [];
 }
 
-export async function sidecarControlOn(key, intervalMin = 45) {
+export async function sidecarControlOn(key, intervalMin = 30) {
   return sidecarRequest('/control/on', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

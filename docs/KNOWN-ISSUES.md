@@ -172,8 +172,9 @@ GUI 侧栏有三条过滤规则，而 tab 一条都没实现——
 即 `ttl:"1h"` 请求被接受但未真正延长到 1h，实际寿命在 30 分钟左右
 （与社区 pi-kimi-keepalive 观测的"名义 5 分钟、实际更长"一致，但未达 1h）。
 
-**对默认间隔的影响**：45min 已落在失效区，**必须下调**。
-建议 30min（在 28min 验证有效范围内，留安全余量）；边界探测正在精确定位。
+**已修正**：默认间隔 45min → **30min**。完整实验矩阵见 [TTL-FINDINGS.md](TTL-FINDINGS.md)。
+关键追加证据：rebuild 实验（每 6min 一次 × 6 次，36min）全 HIT 证明命中可续期；
+long-ttl 实验证明 TTL 到期后的请求会自重建缓存（非永久丢失）。
 
 原始数据：`docs/verify-ttl-2026-10-20.json`（6.5min）、
 `docs/verify-ttl-45min-2026-10-20.json`（45min）。

@@ -214,7 +214,7 @@ function createHeartbeatClient(React) {
           const next = { ...prev };
           for (const s of data.sessions || []) {
             if (next[s.sessionId] === undefined) {
-              next[s.sessionId] = s.intervalMin || 45;
+              next[s.sessionId] = s.intervalMin || 30;
             }
           }
           return next;
@@ -241,7 +241,7 @@ function createHeartbeatClient(React) {
           body: JSON.stringify({
             sessionId,
             on: nextOn,
-            intervalMin: Number(inputValues[sessionId] || currentInterval || 45),
+            intervalMin: Number(inputValues[sessionId] || currentInterval || 30),
           }),
         });
         await fetchState();
@@ -351,7 +351,7 @@ function createHeartbeatClient(React) {
                   }
                 }
 
-                const currentVal = inputValues[s.sessionId] !== undefined ? inputValues[s.sessionId] : (s.intervalMin || 45);
+                const currentVal = inputValues[s.sessionId] !== undefined ? inputValues[s.sessionId] : (s.intervalMin || 30);
                 const warnText = warningMap[s.sessionId] || (Number(currentVal) >= 60 ? '⚠️ 间隔≥60min，1h TTL 缓存会在 ping 间过期' : null);
 
                 return h('tr', { key: s.sessionId },

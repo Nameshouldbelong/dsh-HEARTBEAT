@@ -78,10 +78,10 @@ test('Contract-E: /HTON, /HTOFF, /HTO 回执与状态变更', async (t) => {
 
     // 1. /HTON 开启（默认 50min），开启即立即执行首次保温
     const r1 = await executeHton(sessionId, tmpFile);
-    assert.equal(r1, '💓 心跳已开启（间隔 45min），已立即执行首次保温');
+    assert.equal(r1, '💓 心跳已开启（间隔 30min），已立即执行首次保温');
     let state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].on, true);
-    assert.equal(state.sessions[sessionId].intervalMin, 45);
+    assert.equal(state.sessions[sessionId].intervalMin, 30);
     assert.equal(state.sessions[sessionId].waiting, false);
 
     // 2. /HTOFF 关闭
@@ -118,7 +118,7 @@ test('Contract-E: /HTON, /HTOFF, /HTO 回执与状态变更', async (t) => {
     // 状态保持上一次的 45
     assert.equal(state.sessions[sessionId].intervalMin, 45);
 
-    // 7. /HTON 沿用现有间隔（45min）
+    // 7. /HTON 沿用现有间隔（上一步设的 45min）
     const r7 = await executeHton(sessionId, tmpFile);
     assert.equal(r7, '💓 心跳已开启（间隔 45min），已立即执行首次保温');
   } finally {
@@ -166,7 +166,7 @@ test('第八章: sidecar 不可达 -> 诚实回执 + 保留开启意图', async 
     // sidecar 不可达时 /sessions 返回 [] -> resolveSessionKey 依赖 state 里已有 key
     // 先种入 key（模拟此前成功开启过）
     const { updateSessionState } = await import('../lib/state.mjs');
-    updateSessionState(tmpFile, sessionId, { key: 'dshsc-down', on: false, intervalMin: 45 });
+    updateSessionState(tmpFile, sessionId, { key: 'dshsc-down', on: false, intervalMin: 30 });
 
     const r1 = await executeHton(sessionId, tmpFile);
     assert.ok(r1.includes('sidecar 未响应'), r1);
@@ -197,10 +197,10 @@ test('KI-3: /HTON 存储 key 漂移（409）自动轮换到新鲜 key', async (t
     const { updateSessionState } = await import('../lib/state.mjs');
     const sessionId = 'test-duty-drift';
     // 模拟漂移前存下的旧 key
-    updateSessionState(tmpFile, sessionId, { key: 'dshsc-stale', on: false, intervalMin: 45 });
+    updateSessionState(tmpFile, sessionId, { key: 'dshsc-stale', on: false, intervalMin: 30 });
 
     const r = await executeHton(sessionId, tmpFile);
-    assert.equal(r, '💓 心跳已开启（间隔 45min），已立即执行首次保温', '轮换成功应直接开启而非 waiting');
+    assert.equal(r, '💓 心跳已开启（间隔 30min），已立即执行首次保温', '轮换成功应直接开启而非 waiting');
     const state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].key, 'dshsc-fresh');
     assert.equal(state.sessions[sessionId].waiting, false);
