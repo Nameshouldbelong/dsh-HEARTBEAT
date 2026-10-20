@@ -37,6 +37,34 @@ test('extractUsage: 正确提取使用量信息', () => {
   assert.equal(usage.output_tokens, 25);
 });
 
+test('extractUsage: openai-completions 协议 cached_tokens 归一化为 cache_read（2026-10-19 协议切换）', () => {
+  // openai 非流式 JSON 响应形态（生产实测：prompt_tokens_details.cached_tokens + 顶层 cached_tokens）
+  const openaiBody = JSON.stringify({
+    id: 'chatcmpl-x',
+    usage: { prompt_tokens: 174630, completion_tokens: 19, total_tokens: 174649, cached_tokens: 174630,
+      prompt_tokens_details: { cached_tokens: 174630 } },
+  });
+  const u1 = sidecar.extractUsage(openaiBody);
+  assert.equal(u1.cache_read_input_tokens, 174630, 'openai cached_tokens 应映射到 cache_read_input_tokens');
+
+  // openai SSE 流式形态（choices delta + 尾帧 usage）
+  const openaiSse = 'data: {"choices":[{"delta":{"content":"o"}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":500,"cached_tokens":460,"prompt_tokens_details":{"cached_tokens":460}}}\n\n';
+  const u2 = sidecar.extractUsage(openaiSse);
+  assert.equal(u2.cache_read_input_tokens, 460);
+
+  // anthropic 形态不受影响（无 cached_tokens 字段时不覆写）
+  const anth = sidecar.extractUsage('data: {"usage":{"input_tokens":10,"cache_read_input_tokens":7}}');
+  assert.equal(anth.cache_read_input_tokens, 7);
+
+  // openai 形态 cached=0（真 miss）不注入字段，分类仍走 no-cache
+  const miss = sidecar.extractUsage(JSON.stringify({ usage: { prompt_tokens: 900, cached_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } } }));
+  assert.equal(miss.cache_read_input_tokens, undefined);
+  assert.equal(sidecar.classifyPingResult(200, miss), 'no-cache');
+
+  // 归一化后全量命中被正确判为 hit（回归本次生产 bug：174630/174630 被误判 no-cache）
+  assert.equal(sidecar.classifyPingResult(200, u1), 'hit');
+});
+
 test('B5: buildPingBody 固定 max_tokens=16（2026-10-15 实测：max_tokens=1 不参与前缀缓存，16 为已验证最低档；ping 输出整体丢弃），其余字段原样', () => {
   const recorded = Buffer.from(JSON.stringify({ model: 'k3', max_tokens: 1024, stream: undefined, system: 'S', messages: [{ role: 'user', content: 'x' }], tools: [{ name: 't' }] }));
   const out = JSON.parse(sidecar.buildPingBody(recorded).toString('utf8'));
@@ -514,4 +542,32 @@ test('T9 [KNOWN-ISSUE]: 双会话同 system -> affinity key 碰撞（显式记�
     'KNOWN-ISSUE: B 的最后请求体覆盖了 A'
   );
   sidecar.recordedRequests.delete(sessA.id);
+});
+
+test('affinityKey: openai-completions 形态按 messages 里 system 段取 hash（KI-1 碰撞修复）', () => {
+  // anthropic 形态：顶层 system
+  const anth = sidecar.affinityKey({ system: 'Plabable merge session prefix', messages: [] }).id;
+  // openai 形态：system 在 messages[0]，同一内容应得到同一 key
+  const oa = sidecar.affinityKey({ messages: [{ role: 'system', content: 'Plabable merge session prefix' }, { role: 'user', content: 'go' }] }).id;
+  assert.equal(oa, anth, '同 system 内容（两种协议形态）应同 key');
+
+  // 不同 system 必须不同 key（修复前全部 openai 流量共用 sha256('""') 单一 key）
+  const other = sidecar.affinityKey({ messages: [{ role: 'system', content: 'Totally different session' }, { role: 'user', content: 'hi' }] }).id;
+  assert.notEqual(other, oa);
+
+  // 多段 system 拼接稳定
+  const multi = sidecar.affinityKey({ messages: [{ role: 'system', content: 'A' }, { role: 'system', content: 'B' }, { role: 'user', content: 'x' }] }).id;
+  const multi2 = sidecar.affinityKey({ messages: [{ role: 'system', content: 'A' }, { role: 'system', content: 'B' }, { role: 'user', content: 'y' }] }).id;
+  assert.equal(multi, multi2);
+
+  // metadata.user_id 优先级不变
+  const meta = sidecar.affinityKey({ metadata: { user_id: 'e2e-custom' }, system: 'zzz', messages: [{ role: 'system', content: 'zzz' }] });
+  assert.equal(meta.id, 'e2e-custom');
+  assert.equal(meta.synthesized, false);
+
+  // 无 system 段：两种协议形态行为一致（都落入空串 hash 的公共 key）——契约边缘，
+  // 与 anthropic 无 system 行为对称；DSH 真实流量恒带 system 段，不触发此路径
+  const noSys1 = sidecar.affinityKey({ messages: [{ role: 'user', content: 'a' }] }).id;
+  const noSysAnth = sidecar.affinityKey({ system: '' }).id;
+  assert.equal(noSys1, noSysAnth, '无 system 段与空 system 行为对称');
 });

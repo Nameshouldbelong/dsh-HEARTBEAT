@@ -29,7 +29,18 @@ function log(obj) {
 
 function affinityKey(j) {
   if (j.metadata && j.metadata.user_id) return { id: j.metadata.user_id, synthesized: false };
-  const sys = typeof j.system === 'string' ? j.system : JSON.stringify(j.system || '');
+  let sys = j.system;
+  if (sys === undefined && Array.isArray(j.messages)) {
+    // openai-completions 形态（2026-10-19 起 kimi-coding 协议）：system 是
+    // messages 里 role==='system' 的项，没有顶层 system 字段。
+    // 旧实现只看顶层 system -> 所有 openai 流量 hash 同一空串 -> 全部会话共用
+    // 单一 key、recordedRequests 互相覆盖（KI-1 碰撞成真）。必须兼容两种形态。
+    sys = j.messages
+      .filter((m) => m && m.role === 'system')
+      .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+      .join('\n');
+  }
+  sys = typeof sys === 'string' ? sys : JSON.stringify(sys || '');
   return { id: 'dshsc-' + crypto.createHash('sha256').update(sys.slice(0, 8000)).digest('hex').slice(0, 16), synthesized: true };
 }
 
@@ -51,6 +62,15 @@ function extractUsage(txt) {
     if (end === -1) break;
     try { Object.assign(merged, JSON.parse(txt.slice(braceStart, end + 1))); } catch (e) {}
     from = end + 1;
+  }
+  // 2026-10-19 起 kimi-coding 协议切到 openai-completions：缓存读取语义在
+  // prompt_tokens_details.cached_tokens（anthropic 形态是 cache_read_input_tokens）。
+  // 统一归一化到 anthropic 字段名，分类/UI/统计层无需感知协议差异。
+  const cached = Number(
+    (merged.prompt_tokens_details && merged.prompt_tokens_details.cached_tokens) ??
+    merged.cached_tokens ?? 0);
+  if (cached > 0 && merged.cache_read_input_tokens == null) {
+    merged.cache_read_input_tokens = cached;
   }
   return merged;
 }
