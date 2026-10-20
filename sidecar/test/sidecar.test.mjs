@@ -918,7 +918,7 @@ test('2026-10-20: 401/403 立即急停（凭据/配额问题重试无意义）',
   assert.equal(p.health, 'stale');
 });
 
-test('2026-10-20: 空闲截断（maxIdleMin）', async (t) => {
+test('2026-10-20: 无空闲截断——长时间空闲不再自动关闭（用户裁定）', async (t) => {
   const mockUpstream = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
@@ -935,7 +935,6 @@ test('2026-10-20: 空闲截断（maxIdleMin）', async (t) => {
   const port = sidecar.server.address().port;
   const saved = { ...sidecar.config };
   sidecar.config.recencyWindowMs = 0;
-  sidecar.config.maxIdleMin = 0; // 先关闭以完成正常开启
   t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
 
   const req = (path, body) => new Promise((resolve) => {
@@ -947,21 +946,27 @@ test('2026-10-20: 空闲截断（maxIdleMin）', async (t) => {
     if (body) r.write(body); r.end();
   });
 
-  const key = 'test-idle-cutoff';
-  // 真实请求发生在 2 小时前
+  const key = 'test-no-idle-cutoff';
+  // 真实请求发生在 3 天前（远超任何合理的空闲上限）
   sidecar.recordedRequests.set(key, {
     body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S', max_tokens: 100, messages: [{ role: 'user', content: 'x' }] })),
     path: '/v1/chat/completions', headers: {}, model: 'k3',
-    lastSeenMs: Date.now() - 2 * 60 * 60 * 1000,
+    lastSeenMs: Date.now() - 3 * 24 * 60 * 60 * 1000,
   });
-  await req('/control/on', JSON.stringify({ key, intervalMin: 45 }));
-  await new Promise((r) => setTimeout(r, 200));
+  await req('/control/on', JSON.stringify({ key, intervalMin: 30 }));
+  const t0 = Date.now();
+  let p = null;
+  while (Date.now() - t0 < 3000) {
+    p = sidecar.pings.get(key);
+    if (p && p.pingCount >= 1) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(p, 'state 应存在');
+  assert.equal(p.on, true, '长时间空闲不应自动关闭（用户裁定：跨天任务保温仍有性价比）');
+  assert.equal(p.health, 'hit');
+  assert.ok(p.pingCount >= 1, '应正常完成 ping');
+  assert.equal(typeof sidecar.config.maxIdleMin, 'undefined', 'maxIdleMin 配置应已移除');
 
-  // 现在启用空闲截断（30min），手动触发一次 ping
-  sidecar.config.maxIdleMin = 30;
-  sidecar.runPing(key);
-  await new Promise((r) => setTimeout(r, 200));
-  const p = sidecar.pings.get(key);
-  assert.equal(p.on, false, '空闲超时应自动 off');
-  assert.equal(p.health, 'stale');
+  // 关闭清理
+  await req('/control/off', JSON.stringify({ key }));
 });

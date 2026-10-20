@@ -128,11 +128,10 @@ const config = {
   priceCacheReadPerM: parseFloat(process.env.PRICE_CACHE_READ_PER_M || '0.3'),
   // ② 连续 transport 失败急停（401/403 立即停，其余累计到阈值）
   transportFailLimit: parseInt(process.env.TRANSPORT_FAIL_LIMIT || '3', 10),
-  // ③ 空闲截断：距最后一次真实请求超过该分钟数 -> 停止探测（0=不设限）。
-  //    必须远大于心跳间隔（默认 30min），否则第一次周期 ping 就踩中上限、
-  //    保温被自己的护栏杀死（2026-10-20 E2E 实测踩中：30min 间隔 + 30min 上限
-  //    → 30min 后的周期 ping 恰好 idle=30min 被 AUTO-OFF）。默认取间隔的 3 倍。
-  maxIdleMin: parseInt(process.env.MAX_IDLE_MIN || '90', 10),
+  // 注：曾有针对"距最后真实请求超过 N 分钟即停止探测"的空闲截断护栏，
+  // 已按用户要求移除（2026-10-20）。原因：跨天长任务场景下保温仍有性价比，
+  // 而该护栏与心跳间隔耦合（30min 间隔 + 90min 上限会在长任务中途关停）。
+  // 现仅以"缓存未命中/高价"作为绝对关闭指征，见下方 failThreshold 与 spendCapUsd。
 };
 
 // 估算单次 ping 的花费（USD）。usage 里 cached 部分是命中价，其余未命中按 input 价。
@@ -210,19 +209,6 @@ function runPing(key) {
   if (!rec) return;
 
   // 并发保护：该 key 的真实请求 lastSeen <10s 时本次重放顺延 30s
-  // 空闲截断（2026-10-20，对齐社区 maxidle）：距最后一次真实请求超过上限即停止探测，
-  // 避免用户离开后无限期烧钱。0 = 不设限。
-  if (config.maxIdleMin > 0 && rec.lastSeenMs
-      && Date.now() - rec.lastSeenMs > config.maxIdleMin * 60 * 1000) {
-    pingState.on = false;
-    pingState.health = 'stale';
-    pingState.stale = true;
-    if (pingTimers.has(key)) { clearInterval(pingTimers.get(key)); pingTimers.delete(key); }
-    if (pingState.retryTimer) { clearTimeout(pingState.retryTimer); pingState.retryTimer = null; }
-    console.log(`[ping] key=${key} AUTO-OFF: idle beyond ${config.maxIdleMin}min since last real request`);
-    return;
-  }
-
   // (immediate ping / retry / 周期 ping 一律遵守)
   const now = Date.now();
   if (now - rec.lastSeenMs < config.recencyWindowMs) {
