@@ -1,5 +1,10 @@
 // kimi-cache-sidecar: 本地反代 (127.0.0.1:8791) -> https://api.kimi.com/coding/*
-// 注入: 顶层 cache_control {type:ephemeral, ttl:1h} (Kimi Anthropic 兼容端点的 TTL 旋钮)
+// 注入: 按协议自动选择 TTL 旋钮（2026-10-20 修正，官方文档依据见下）
+//       - Anthropic Messages (/v1/messages): 顶层 cache_control {type:ephemeral, ttl:'1h'}
+//       - Chat Completions (/v1/chat/completions): prompt_cache_options {mode:'implicit', ttl:'1h'}
+//       依据 platform.kimi.com/docs/guide/context-caching「如何设置缓存 TTL」。
+//       旧实现只注入 cache_control（Anthropic 写法）；10-19 协议切到 openai-completions 后
+//       该字段被端点忽略 → 实际只按默认 5m TTL 缓存 → 50min 间隔 ping 必然 0% 命中并全价重算。
 //       metadata.user_id 会话亲和键 (客户端已带则保留; 否则按 system 前缀哈希合成)
 // 记录: usage.jsonl 每请求一行 {ts, path, status, injected, usage}
 // 开关: 环境变量 INJECT_TTL=0 / INJECT_AFFINITY=0 可单独关闭
@@ -25,6 +30,24 @@ const LOG = path.join(__dirname, 'usage.jsonl');
 
 function log(obj) {
   try { fs.appendFileSync(LOG, JSON.stringify(obj) + '\n'); } catch (e) {}
+}
+
+// 2026-10-20：TTL 注入按协议分派。Chat Completions 用 prompt_cache_options，
+// Anthropic Messages 用顶层 cache_control。就地修改 obj，返回注入描述或 null。
+function isChatCompletionsPath(p) {
+  return typeof p === 'string' && p.indexOf('/chat/completions') !== -1;
+}
+
+function injectCacheTtl(obj, reqPath) {
+  if (!INJECT_TTL) return null;
+  if (isChatCompletionsPath(reqPath)) {
+    if (obj.prompt_cache_options) return null;
+    obj.prompt_cache_options = { mode: 'implicit', ttl: '1h' };
+    return 'prompt_cache_options=1h';
+  }
+  if (obj.cache_control) return null;
+  obj.cache_control = { type: 'ephemeral', ttl: '1h' };
+  return 'cache_control=1h';
 }
 
 function affinityKey(j) {
@@ -89,6 +112,13 @@ const config = {
   retryDelaysMs: [2 * 60 * 1000, 4 * 60 * 1000], // 临时错误快速抢救：+2min / +4min，不动主 interval
   recencyWindowMs: 10000, // 真实请求 <10s 内
   recencyDeferMs: 30000,  // 重放顺延 30s
+  // 2026-10-20：命中率门槛（低门槛，用户要求"不应太高"）。
+  // cached/prompt >= hitRatioMin 才算 hit；低于门槛视为失败计数。
+  hitRatioMin: parseFloat(process.env.HIT_RATIO_MIN || '0.05'),
+  // 连续失败达到此数 -> 置 stale 并自动 off（不再烧钱）。用户要求"否则认为失败并关闭 ping"。
+  // 单次低命中即判失败并自动关闭（50min 周期下等不到"连续 N 次"，见 runPing 注释）。
+  // 设为 >1 可放宽，但每多等一次就是一次全价重算。
+  failThreshold: parseInt(process.env.FAIL_THRESHOLD || '1', 10),
 };
 
 function buildPingBody(recordedBuffer) {
@@ -103,11 +133,19 @@ function buildPingBody(recordedBuffer) {
 
 // ping 结果三分类：cache 命中 / cache 重建 / 无缓存(2xx 但读写皆 0) / 传输或 API 错误
 // HTTP/API 错误(429/5xx/timeout/ECONNRESET)绝不计入 cache 失败——两者分开统计
-function classifyPingResult(statusCode, usage) {
+function classifyPingResult(statusCode, usage, hitRatioMin) {
   if (statusCode >= 200 && statusCode < 300) {
     const read = Number((usage && usage.cache_read_input_tokens) || 0);
     const creation = Number((usage && (usage.cache_creation_input_tokens || usage.cache_creation_tokens)) || 0);
-    if (read > 0) return 'hit';
+    // 命中率门槛（2026-10-20）：cached 很少（如 12800/291557 = 4.4%）时，
+    // 绝大部分前缀仍按全价重算，不能算 hit。prompt 规模未知时退化为旧的 read>0。
+    const promptTokens = Number(
+      (usage && (usage.prompt_tokens || usage.input_tokens)) || 0);
+    const min = typeof hitRatioMin === 'number' ? hitRatioMin : config.hitRatioMin;
+    if (read > 0) {
+      if (promptTokens > 0 && read / promptTokens < min) return 'no-cache';
+      return 'hit';
+    }
     if (creation > 0) return 'recreated';
     return 'no-cache';
   }
@@ -158,9 +196,10 @@ function runPing(key) {
   let pingBody;
   try {
     const pj = JSON.parse(buildPingBody(rec.body).toString('utf8'));
-    // P0: ping 必须携带与真实请求相同的注入(cache_control ttl=1h + 亲和键),
-    // 否则无顶层 cache_control 只读 5m 池且无亲和路由, 间隔>5min 必 miss
-    if (INJECT_TTL && !pj.cache_control) pj.cache_control = { type: 'ephemeral', ttl: '1h' };
+    // P0: ping 必须携带与真实请求相同的 TTL 注入 + 亲和键，
+    // 否则只读默认 5m 池，间隔>5min 必 miss。按协议分派（Chat Completions
+    // 用 prompt_cache_options，Anthropic Messages 用顶层 cache_control）。
+    injectCacheTtl(pj, rec.path);
     if (INJECT_AFFINITY && !(pj.metadata && pj.metadata.user_id)) {
       pj.metadata = Object.assign({}, pj.metadata, { user_id: key });
     }
@@ -244,12 +283,25 @@ function runPing(key) {
         pingState.retryCount = 0;
 
         if (result === 'no-cache') {
-          // 2xx 但 cache 读写皆 0：才算一次 cache 失败；连续 3 次 -> 挂起置 stale
+          // 2xx 但命中率低于门槛（或读写皆 0）：算一次 cache 失败。
+          // 连续 failThreshold 次（默认 2）-> 置 stale 并自动关闭 ping，止损不烧钱。
           pingState.consecutiveZeroCacheRead = (pingState.consecutiveZeroCacheRead || 0) + 1;
-          if (pingState.consecutiveZeroCacheRead >= 3) {
+          // 2026-10-20：单个 50min 间隔周期内只会 ping 一次，靠"连续 N 次"要等 100 分钟，
+          // 期间每次都是全价重算 —— 太慢。首次 immediate ping 就低命中即视为失败并关闭
+          // （用户要求："命中门槛不应太高，否则认为失败并关闭 ping"）。
+          if (pingState.consecutiveZeroCacheRead >= config.failThreshold) {
             pingState.stale = true;
             pingState.health = 'stale';
-            console.log(`[ping] key=${key} marked stale (3 consecutive pings without cache read/creation)`);
+            pingState.on = false;
+            if (pingTimers.has(key)) {
+              clearInterval(pingTimers.get(key));
+              pingTimers.delete(key);
+            }
+            if (pingState.retryTimer) {
+              clearTimeout(pingState.retryTimer);
+              pingState.retryTimer = null;
+            }
+            console.log(`[ping] key=${key} AUTO-OFF: ${pingState.consecutiveZeroCacheRead} consecutive cache-miss pings (ratio < ${config.hitRatioMin}) — stopped to avoid burning quota`);
           }
         } else {
           pingState.consecutiveZeroCacheRead = 0;
@@ -356,7 +408,7 @@ const server = http.createServer((req, res) => {
           lastError: null,
           retryCount: 0,
           retryTimer: null,
-          consecutiveZeroCacheRead: 0,
+          consecutiveZeroCacheRead: prev.consecutiveZeroCacheRead || 0,
           consecutiveTransportFailures: 0,
         });
         res.writeHead(409, { 'content-type': 'application/json' });
@@ -407,6 +459,9 @@ const server = http.createServer((req, res) => {
         clearTimeout(existing.retryTimer);
         existing.retryTimer = null;
       }
+      // 2026-10-20：完整重置路径必须继承失败计数——旧实现每次归零，
+      // 而 reconciler 每分钟补挂一次，导致"连续 N 次 miss 自动关闭"永不触发。
+      // stale 状态由显式 /control/on 清除（用户主动重开），但计数保留以便继续观察。
       const state = {
         key,
         on: true,
@@ -420,7 +475,7 @@ const server = http.createServer((req, res) => {
         lastError: null,
         retryCount: 0,
         retryTimer: null,
-        consecutiveZeroCacheRead: 0,
+        consecutiveZeroCacheRead: existing.consecutiveZeroCacheRead || 0,
         consecutiveTransportFailures: 0,
       };
       pings.set(key, state);
@@ -494,10 +549,8 @@ const server = http.createServer((req, res) => {
     if (ct.includes('json') && body.length) {
       try {
         const j = JSON.parse(body.toString('utf8'));
-        if (INJECT_TTL && !j.cache_control) {
-          j.cache_control = { type: 'ephemeral', ttl: '1h' };
-          injected.push('cache_control=1h');
-        }
+        const ttlMark = injectCacheTtl(j, req.url);
+        if (ttlMark) injected.push(ttlMark);
         if (INJECT_AFFINITY) {
           const aff = affinityKey(j);
           if (aff.synthesized) {
@@ -610,6 +663,8 @@ module.exports = {
   extractUsage,
   buildPingBody,
   classifyPingResult,
+  injectCacheTtl,
+  isChatCompletionsPath,
   runPing,
   sessions,
   recordedRequests,

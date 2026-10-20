@@ -708,3 +708,111 @@ test('P0 回归: /control/on 幂等——reconciler 每分钟补挂不得白 pin
     body: JSON.stringify({ key: keyI }),
   });
 });
+
+test('2026-10-20: TTL 注入按协议分派（Chat Completions 用 prompt_cache_options，Anthropic 用 cache_control）', () => {
+  // Chat Completions 协议（10-19 起 kimi-coding 实际协议）
+  const chatBody = { model: 'k3-256k', messages: [{ role: 'user', content: 'x' }] };
+  const mark1 = sidecar.injectCacheTtl(chatBody, '/v1/chat/completions?beta=true');
+  assert.equal(mark1, 'prompt_cache_options=1h');
+  assert.deepEqual(chatBody.prompt_cache_options, { mode: 'implicit', ttl: '1h' });
+  assert.equal(chatBody.cache_control, undefined, 'Chat Completions 不得注入 cache_control（端点忽略）');
+
+  // Anthropic Messages 协议
+  const anthBody = { model: 'k3', messages: [] };
+  const mark2 = sidecar.injectCacheTtl(anthBody, '/v1/messages');
+  assert.equal(mark2, 'cache_control=1h');
+  assert.deepEqual(anthBody.cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.equal(anthBody.prompt_cache_options, undefined);
+
+  // 已存在客户端注入时保留原样，不覆盖
+  const preset = { prompt_cache_options: { mode: 'implicit', ttl: '5m' } };
+  assert.equal(sidecar.injectCacheTtl(preset, '/v1/chat/completions'), null);
+  assert.deepEqual(preset.prompt_cache_options, { mode: 'implicit', ttl: '5m' });
+});
+
+test('2026-10-20: 命中率门槛——低命中（4.4%）不算 hit，避免"伪 hit"掩盖烧钱', () => {
+  // 生产实测：cached=12800 / prompt=291557 = 4.4%，旧逻辑判 hit（错）
+  const lowRatio = { prompt_tokens: 291557, cached_tokens: 12800, cache_read_input_tokens: 12800 };
+  assert.equal(sidecar.classifyPingResult(200, lowRatio), 'no-cache');
+
+  // 真实命中 99%+ 仍是 hit
+  const highRatio = { prompt_tokens: 291557, cached_tokens: 291328, cache_read_input_tokens: 291328 };
+  assert.equal(sidecar.classifyPingResult(200, highRatio), 'hit');
+
+  // 小前缀全量命中（探针场景 103/103）也是 hit
+  const tiny = { prompt_tokens: 103, cached_tokens: 103, cache_read_input_tokens: 103 };
+  assert.equal(sidecar.classifyPingResult(200, tiny), 'hit');
+
+  // 门槛可调：设为 0 时任何 read>0 都算 hit（兼容旧行为）
+  assert.equal(sidecar.classifyPingResult(200, lowRatio, 0), 'hit');
+
+  // 读写皆 0 仍 no-cache；有 creation 仍 recreated
+  assert.equal(sidecar.classifyPingResult(200, { prompt_tokens: 100, cached_tokens: 0 }), 'no-cache');
+  assert.equal(sidecar.classifyPingResult(200, { prompt_tokens: 100, cache_creation_input_tokens: 50 }), 'recreated');
+});
+
+test('2026-10-20: 连续低命中自动关闭 ping（止损，不再烧 quota）', async (t) => {
+  // 上游恒定返回低命中（模拟 TTL 失效场景）
+  const mockUpstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'm',
+        usage: { prompt_tokens: 100000, cached_tokens: 1000, prompt_tokens_details: { cached_tokens: 1000 }, cache_read_input_tokens: 1000 },
+      }));
+    });
+  });
+  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const port = sidecar.server.address().port;
+  const savedConfig = { ...sidecar.config };
+  sidecar.config.recencyWindowMs = 0;
+  t.after(() => {
+    Object.assign(sidecar.config, savedConfig);
+    mockUpstream.close();
+    sidecar.server.close();
+  });
+
+  const req = (path, body) => new Promise((resolve, reject) => {
+    const r = http.request({ hostname: '127.0.0.1', port, path, method: body ? 'POST' : 'GET',
+      headers: body ? { 'content-type': 'application/json' } : {} }, (res) => {
+      const cs = []; res.on('data', (c) => cs.push(c));
+      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(cs).toString())); } catch { resolve({}); } });
+    });
+    r.on('error', reject);
+    if (body) r.write(body);
+    r.end();
+  });
+
+  const key = 'test-key-autooff';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S-autooff', max_tokens: 100, messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: 0,
+  });
+
+  await req('/control/on', JSON.stringify({ key, intervalMin: 50 }));
+  const waitFor = async (fn, ms = 4000) => {
+    const t0 = Date.now();
+    for (;;) { const v = await fn(); if (v) return v; if (Date.now() - t0 > ms) return null; await new Promise((r) => setTimeout(r, 25)); }
+  };
+  const st = await waitFor(async () => {
+    const s = await req('/control/state');
+    const p = (s.pings || []).find((x) => x.key === key);
+    return p && p.on === false ? p : null;
+  });
+  assert.ok(st, '连续低命中后应自动 off');
+  assert.equal(st.health, 'stale');
+  assert.equal(st.on, false, '必须停止 ping 以免继续烧 quota');
+
+  // reconciler 补挂不得重置失败计数（否则自动关闭永远不触发）
+  const raw = sidecar.pings.get(key);
+  const before = raw.consecutiveZeroCacheRead;
+  await req('/control/on', JSON.stringify({ key, intervalMin: 50 }));
+  assert.equal(sidecar.pings.get(key).consecutiveZeroCacheRead, before, '补挂必须继承失败计数');
+});
