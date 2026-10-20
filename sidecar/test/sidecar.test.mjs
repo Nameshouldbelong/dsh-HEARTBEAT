@@ -571,3 +571,140 @@ test('affinityKey: openai-completions 形态按 messages 里 system 段取 hash�
   const noSysAnth = sidecar.affinityKey({ system: '' }).id;
   assert.equal(noSys1, noSysAnth, '无 system 段与空 system 行为对称');
 });
+
+test('P0 回归: /control/on 幂等——reconciler 每分钟补挂不得白 ping 也不得清空 retry（2026-10-20 生产事故）', async (t) => {
+  let responder = () => ({
+    status: 200,
+    json: { id: 'msg-mock', type: 'message', usage: { input_tokens: 100, cache_read_input_tokens: 90, cache_creation_input_tokens: 0, output_tokens: 16 } },
+  });
+  const mockUpstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const r = responder();
+      res.writeHead(r.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(r.json));
+    });
+  });
+  await new Promise((resolve) => mockUpstream.listen(0, '127.0.0.1', resolve));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+
+  await new Promise((resolve) => sidecar.server.listen(0, '127.0.0.1', resolve));
+  const sidecarPort = sidecar.server.address().port;
+
+  const savedConfig = { ...sidecar.config };
+  sidecar.config.retryDelaysMs = [40, 80];
+  sidecar.config.recencyWindowMs = 0;
+
+  t.after(() => {
+    Object.assign(sidecar.config, savedConfig);
+    mockUpstream.close();
+    sidecar.server.close();
+  });
+
+  const request = (path, options = {}) => new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: '127.0.0.1', port: sidecarPort, path, method: options.method || 'GET', headers: options.headers || {} },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          try { resolve({ status: res.statusCode, json: JSON.parse(body) }); }
+          catch { resolve({ status: res.statusCode, text: body }); }
+        });
+      }
+    );
+    req.on('error', reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+  const waitFor = async (fn, timeoutMs = 3000, step = 20) => {
+    const start = Date.now();
+    for (;;) {
+      const v = await fn();
+      if (v) return v;
+      if (Date.now() - start > timeoutMs) return null;
+      await new Promise((r) => setTimeout(r, step));
+    }
+  };
+  const pingStateOf = async (key) => {
+    const r = await request('/control/state');
+    return r.json.pings.find((x) => x.key === key) || null;
+  };
+  const onKey = (key, intervalMin) => request('/control/on', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key, intervalMin }),
+  });
+
+  const keyI = 'test-key-idempotent';
+  sidecar.recordedRequests.set(keyI, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S-idem', max_tokens: 100, messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/messages',
+    headers: {},
+    model: 'k3',
+    lastSeenMs: 0,
+  });
+
+  // 1. 首次开启：正常 immediate ping
+  const r1 = await onKey(keyI, 50);
+  assert.equal(r1.status, 200);
+  assert.equal(r1.json.immediatePing, true);
+  const s1 = await waitFor(async () => {
+    const p = await pingStateOf(keyI);
+    return p && p.pingCount >= 1 ? p : null;
+  });
+  assert.ok(s1);
+
+  // 2. reconciler 式重复补挂（同间隔）：必须 alreadyOn 且不再 ping
+  const r2 = await onKey(keyI, 50);
+  assert.equal(r2.status, 200);
+  assert.equal(r2.json.alreadyOn, true, '同状态重复 /control/on 应幂等短路');
+  assert.equal(r2.json.immediatePing, false);
+  await new Promise((r) => setTimeout(r, 100));
+  const s2 = await pingStateOf(keyI);
+  assert.equal(s2.pingCount, s1.pingCount, '重复补挂不得触发新的 ping');
+
+  // 3. 制造 429 失败进入 retry，然后重复 /control/on：retry 状态不得被清空
+  responder = () => ({ status: 429, json: { error: { type: 'rate_limit' } } });
+  sidecar.runPing(keyI);
+  const sRetry = await waitFor(async () => {
+    const p = await pingStateOf(keyI);
+    return p && p.health === 'retrying' && p.retryCount === 1 ? p : null;
+  });
+  assert.ok(sRetry, '429 后应 retrying #1');
+  const r3 = await onKey(keyI, 50);
+  assert.equal(r3.json.alreadyOn, true);
+  const raw = sidecar.pings.get(keyI);
+  assert.equal(raw.retryCount, 1, '重复补挂不得重置 retryCount');
+  assert.ok(raw.retryTimer, '重复补挂不得清空 pending retryTimer');
+  assert.equal(raw.health, 'retrying');
+
+  // 4. 上游恢复：被保留的 retry 定时器应照常触发并恢复 hit
+  responder = () => ({ status: 200, json: { id: 'm', usage: { input_tokens: 100, cache_read_input_tokens: 95, cache_creation_input_tokens: 0, output_tokens: 16 } } });
+  const sHit = await waitFor(async () => {
+    const p = await pingStateOf(keyI);
+    return p && p.health === 'hit' && p.retryCount === 0 ? p : null;
+  });
+  assert.ok(sHit, 'retry 定时器应存活并恢复 hit（生产事故前会被每分钟清空）');
+
+  // 5. 间隔变更不算幂等：应走完整重置 + immediate ping
+  const before = (await pingStateOf(keyI)).pingCount;
+  const r5 = await onKey(keyI, 30);
+  assert.equal(r5.json.immediatePing, true, '间隔变化是真实变更，不短路');
+  await waitFor(async () => {
+    const p = await pingStateOf(keyI);
+    return p && p.pingCount > before ? p : null;
+  });
+  assert.equal((await pingStateOf(keyI)).intervalMin, 30);
+
+  await request('/control/off', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: keyI }),
+  });
+});
