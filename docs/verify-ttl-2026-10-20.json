@@ -1,0 +1,41 @@
+{
+  "startedAt": "2026-10-20T10:01:38.840Z",
+  "model": "k3-256k",
+  "waitMin": 6.5,
+  "steps": [
+    {
+      "step": "A",
+      "status": 200,
+      "prompt": 15133,
+      "cached": 15133,
+      "write": 0,
+      "ratio": 1,
+      "at": "2026-10-20T10:01:41.396Z"
+    },
+    {
+      "step": "A2",
+      "status": 200,
+      "prompt": 15133,
+      "cached": 15133,
+      "write": 0,
+      "ratio": 1,
+      "at": "2026-10-20T10:01:47.110Z"
+    },
+    {
+      "step": "B",
+      "status": 200,
+      "prompt": 15133,
+      "cached": 15133,
+      "write": 0,
+      "ratio": 1,
+      "at": "2026-10-20T10:07:57.823Z"
+    }
+  ],
+  "verdict": {
+    "ok": true,
+    "reason": "等待 6.5 分钟后仍命中 100.0% —— 1h TTL 生效",
+    "baselineRatio": 1,
+    "afterWaitRatio": 1
+  },
+  "finishedAt": "2026-10-20T10:07:57.823Z"
+}
