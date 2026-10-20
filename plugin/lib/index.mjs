@@ -256,7 +256,7 @@ export function apply(ctx) {
               key: s.key,
               on: s.on === true,
               waiting: s.waiting === true,
-              intervalMin: s.intervalMin || 50,
+              intervalMin: s.intervalMin || 45,
               updatedAt: s.updatedAt,
             });
           }
@@ -272,7 +272,7 @@ export function apply(ctx) {
                 key,
                 on: false,
                 waiting: false,
-                intervalMin: 50,
+                intervalMin: 45,
               });
             }
           }

@@ -88,13 +88,13 @@ export async function runReconciliation({ ctx, statePath, activeSessionIds }) {
     // 活跃会话且 on: true -> 对 sidecar /control/on 做一次补挂（幂等）
     if (session.on && session.key) {
       try {
-        const res = await sidecarControlOn(session.key, session.intervalMin || 50);
+        const res = await sidecarControlOn(session.key, session.intervalMin || 45);
         // 409 no-request-recorded：sidecar 重启丢了内存请求体，或存储 key 已随
         // system prompt 漂移失效（KI-3）。先试 key 轮换；不成则标记 waiting，
         // UI 显示 WAITING FOR REAL REQUEST，真实流量到达后 sidecar 自动恢复
         let waiting = res != null && res.status === 409;
         if (waiting) {
-          const rotated = await rotateStaleKey(sessionId, statePath, session.key, session.intervalMin || 50)
+          const rotated = await rotateStaleKey(sessionId, statePath, session.key, session.intervalMin || 45)
             .catch(() => null);
           if (rotated) waiting = false;
         }
