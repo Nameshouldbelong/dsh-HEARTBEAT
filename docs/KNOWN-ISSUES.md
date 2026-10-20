@@ -99,7 +99,7 @@ cache_read=270k，hit），无每分钟白 ping。
 **验证**：单测 28/28；生产注入字段实测为 `prompt_cache_options=1h`。
 **待验证**：TTL 1h 实际生效性需配额恢复后用真实 ping 确认（当前配额已耗尽）。
 
-## KI-7：护栏缺失（花费无上限、无急停、无空闲截断）— ✅ 已补齐，2026-10-20
+## KI-7：护栏缺失（花费无上限、无急停）— ✅ 已补齐，2026-10-20
 
 对齐社区 [pi-kimi-keepalive](https://www.npmjs.com/package/pi-kimi-keepalive)
 与 [dsh-cache-warmer](https://github.com/yoggu/dsh-cache-warmer) 的护栏设计：
@@ -112,13 +112,16 @@ cache_read=270k，hit），无每分钟白 ping。
 | 失败自关 | `FAIL_THRESHOLD` | 1 | 单次低命中即 off |
 | 凭据/配额急停 | — | — | **401/403 立即 off**（重试无意义） |
 | 失败熔断 | `TRANSPORT_FAIL_LIMIT` | 3 | 429/5xx/超时连续 3 次 off |
-| 空闲截断 | `MAX_IDLE_MIN` | 30min | 距最后真实请求超时 → off |
 
 花费估算口径（保守）：未命中部分按 `PRICE_INPUT_PER_M`（默认 $3/1M），
 命中部分按 `PRICE_CACHE_READ_PER_M`（默认 $0.3/1M）。`/control/state` 暴露
 `spentUsd`，UI 遥测行显示「花费≈$x.xxxx」。
 
-测试：sidecar 17/17（新增花费上限/403 急停/空闲截断 3 项）+ plugin 14/14。
+> **2026-10-20 修订**：原「空闲截断」（`MAX_IDLE_MIN`）护栏已按用户要求**移除**。
+> 原因：跨天长任务场景下保温仍有性价比，而该阈值与心跳间隔耦合，会在长任务中途
+> 关停保温。现仅以**缓存未命中（高价）**与**花费上限**作为关闭指征。
+
+测试：sidecar 17/17（新增花费上限/403 急停/无空闲截断 3 项）+ plugin 14/14。
 
 ## KI-8：HB tab 混入孤儿 subagent 与已归档会话（✅ 已修复，2026-10-20）
 
