@@ -54,7 +54,7 @@ export function updateSessionState(filePath = getDefaultStatePath(), sessionId, 
   const current = state.sessions[sessionId] || {
     key: `dshsc-${sessionId.slice(0, 16)}`,
     on: false,
-    intervalMin: 50,
+    intervalMin: 45,
   };
   const updated = {
     ...current,

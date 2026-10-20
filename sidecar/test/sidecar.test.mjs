@@ -816,3 +816,152 @@ test('2026-10-20: 连续低命中自动关闭 ping（止损，不再烧 quota）
   await req('/control/on', JSON.stringify({ key, intervalMin: 50 }));
   assert.equal(sidecar.pings.get(key).consecutiveZeroCacheRead, before, '补挂必须继承失败计数');
 });
+
+test('2026-10-20: 花费上限急停（spend cap）', async (t) => {
+  const mockUpstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      // 100k prompt 全未命中 => 每次约 $0.3
+      res.end(JSON.stringify({ id: 'm', usage: { prompt_tokens: 100000, cached_tokens: 0, prompt_tokens_details: { cached_tokens: 0 }, cache_read_input_tokens: 0 } }));
+    });
+  });
+  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const port = sidecar.server.address().port;
+  const saved = { ...sidecar.config };
+  // 关掉失败自关，单独验证花费上限；同时把上限设很小
+  sidecar.config.failThreshold = 999;
+  sidecar.config.spendCapUsd = 0.001;
+  sidecar.config.recencyWindowMs = 0;
+  t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
+
+  const req = (path, body) => new Promise((resolve) => {
+    const r = http.request({ hostname: '127.0.0.1', port, path, method: body ? 'POST' : 'GET',
+      headers: body ? { 'content-type': 'application/json' } : {} }, (res) => {
+      const cs = []; res.on('data', (c) => cs.push(c));
+      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(cs).toString())); } catch { resolve({}); } });
+    });
+    if (body) r.write(body); r.end();
+  });
+
+  const key = 'test-spend-cap';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S', max_tokens: 100, messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: Date.now(),
+  });
+  await req('/control/on', JSON.stringify({ key, intervalMin: 45 }));
+  const t0 = Date.now();
+  let p = null;
+  while (Date.now() - t0 < 4000) {
+    const s = await req('/control/state');
+    p = (s.pings || []).find((x) => x.key === key);
+    if (p && p.on === false) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(p, 'state 应有该 key');
+  assert.equal(p.on, false, '达到花费上限应自动 off');
+  assert.ok(p.spentUsd > 0, '应记录累计花费');
+});
+
+test('2026-10-20: 401/403 立即急停（凭据/配额问题重试无意义）', async (t) => {
+  const mockUpstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'quota exceeded', type: 'exceeded_current_quota_error' } }));
+    });
+  });
+  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const port = sidecar.server.address().port;
+  const saved = { ...sidecar.config };
+  sidecar.config.recencyWindowMs = 0;
+  sidecar.config.retryDelaysMs = [10000, 20000]; // 长 retry，确保是急停而非 retry
+  t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
+
+  const req = (path, body) => new Promise((resolve) => {
+    const r = http.request({ hostname: '127.0.0.1', port, path, method: body ? 'POST' : 'GET',
+      headers: body ? { 'content-type': 'application/json' } : {} }, (res) => {
+      const cs = []; res.on('data', (c) => cs.push(c));
+      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(cs).toString())); } catch { resolve({}); } });
+    });
+    if (body) r.write(body); r.end();
+  });
+
+  const key = 'test-fatal-403';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S', max_tokens: 100, messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: Date.now(),
+  });
+  await req('/control/on', JSON.stringify({ key, intervalMin: 45 }));
+  const t0 = Date.now();
+  let p = null;
+  while (Date.now() - t0 < 3000) {
+    const s = await req('/control/state');
+    p = (s.pings || []).find((x) => x.key === key);
+    if (p && p.on === false) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(p);
+  assert.equal(p.on, false, '403 应立即 off，不进入 retry');
+  assert.equal(p.health, 'stale');
+});
+
+test('2026-10-20: 空闲截断（maxIdleMin）', async (t) => {
+  const mockUpstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'm', usage: { prompt_tokens: 100, cached_tokens: 100, prompt_tokens_details: { cached_tokens: 100 }, cache_read_input_tokens: 100 } }));
+    });
+  });
+  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const port = sidecar.server.address().port;
+  const saved = { ...sidecar.config };
+  sidecar.config.recencyWindowMs = 0;
+  sidecar.config.maxIdleMin = 0; // 先关闭以完成正常开启
+  t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
+
+  const req = (path, body) => new Promise((resolve) => {
+    const r = http.request({ hostname: '127.0.0.1', port, path, method: body ? 'POST' : 'GET',
+      headers: body ? { 'content-type': 'application/json' } : {} }, (res) => {
+      const cs = []; res.on('data', (c) => cs.push(c));
+      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(cs).toString())); } catch { resolve({}); } });
+    });
+    if (body) r.write(body); r.end();
+  });
+
+  const key = 'test-idle-cutoff';
+  // 真实请求发生在 2 小时前
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S', max_tokens: 100, messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3',
+    lastSeenMs: Date.now() - 2 * 60 * 60 * 1000,
+  });
+  await req('/control/on', JSON.stringify({ key, intervalMin: 45 }));
+  await new Promise((r) => setTimeout(r, 200));
+
+  // 现在启用空闲截断（30min），手动触发一次 ping
+  sidecar.config.maxIdleMin = 30;
+  sidecar.runPing(key);
+  await new Promise((r) => setTimeout(r, 200));
+  const p = sidecar.pings.get(key);
+  assert.equal(p.on, false, '空闲超时应自动 off');
+  assert.equal(p.health, 'stale');
+});

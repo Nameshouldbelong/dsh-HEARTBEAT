@@ -214,7 +214,7 @@ function createHeartbeatClient(React) {
           const next = { ...prev };
           for (const s of data.sessions || []) {
             if (next[s.sessionId] === undefined) {
-              next[s.sessionId] = s.intervalMin || 50;
+              next[s.sessionId] = s.intervalMin || 45;
             }
           }
           return next;
@@ -351,7 +351,7 @@ function createHeartbeatClient(React) {
                   }
                 }
 
-                const currentVal = inputValues[s.sessionId] !== undefined ? inputValues[s.sessionId] : (s.intervalMin || 50);
+                const currentVal = inputValues[s.sessionId] !== undefined ? inputValues[s.sessionId] : (s.intervalMin || 45);
                 const warnText = warningMap[s.sessionId] || (Number(currentVal) >= 60 ? '⚠️ 间隔≥60min，1h TTL 缓存会在 ping 间过期' : null);
 
                 return h('tr', { key: s.sessionId },
@@ -397,7 +397,9 @@ function createHeartbeatClient(React) {
                       `次数: ${ping?.pingCount || 0} | Cache read: ${ping?.lastUsage?.cache_read_input_tokens || 0}`
                     ),
                     h('div', { className: 'hb-mono', style: { fontSize: 11, color: 'var(--dsh-text-muted, #9ca3af)' } },
-                      `Cache creation: ${ping?.lastUsage?.cache_creation_input_tokens || 0}` + (ping?.lastError ? ` | 错误: ${ping.lastError}` : '')
+                      `Cache creation: ${ping?.lastUsage?.cache_creation_input_tokens || 0}` +
+                      (ping?.spentUsd > 0 ? ` | 花费≈$${ping.spentUsd}` : '') +
+                      (ping?.lastError ? ` | 错误: ${ping.lastError}` : '')
                     )
                   )
                 );

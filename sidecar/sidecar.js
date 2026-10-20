@@ -116,10 +116,32 @@ const config = {
   // cached/prompt >= hitRatioMin 才算 hit；低于门槛视为失败计数。
   hitRatioMin: parseFloat(process.env.HIT_RATIO_MIN || '0.05'),
   // 连续失败达到此数 -> 置 stale 并自动 off（不再烧钱）。用户要求"否则认为失败并关闭 ping"。
-  // 单次低命中即判失败并自动关闭（50min 周期下等不到"连续 N 次"，见 runPing 注释）。
+  // 单次低命中即判失败并自动关闭（周期内等不到"连续 N 次"，见 runPing 注释）。
   // 设为 >1 可放宽，但每多等一次就是一次全价重算。
   failThreshold: parseInt(process.env.FAIL_THRESHOLD || '1', 10),
+  // 2026-10-20 新增（对齐社区 pi-kimi-keepalive 的护栏）：
+  // ① 会话探测花费上限（估算 USD）。累计估算成本达到上限 -> 自动 off 并记录。
+  //    估算口径保守：未命中部分按 input 价，命中部分按 cacheRead 价（kimi-k3 参考
+  //    input=$3/1M、cacheRead=$0.3/1M）。0 表示不设上限。
+  spendCapUsd: parseFloat(process.env.SPEND_CAP_USD || '1.00'),
+  priceInputPerM: parseFloat(process.env.PRICE_INPUT_PER_M || '3'),
+  priceCacheReadPerM: parseFloat(process.env.PRICE_CACHE_READ_PER_M || '0.3'),
+  // ② 连续 transport 失败急停（401/403 立即停，其余累计到阈值）
+  transportFailLimit: parseInt(process.env.TRANSPORT_FAIL_LIMIT || '3', 10),
+  // ③ 空闲截断：距最后一次真实请求超过该分钟数 -> 停止探测（0=不设限）
+  maxIdleMin: parseInt(process.env.MAX_IDLE_MIN || '30', 10),
 };
+
+// 估算单次 ping 的花费（USD）。usage 里 cached 部分是命中价，其余未命中按 input 价。
+function estimatePingCostUsd(usage) {
+  const u = usage || {};
+  const prompt = Number(u.prompt_tokens || u.input_tokens || 0);
+  const cached = Number(
+    (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) ??
+    u.cached_tokens ?? u.cache_read_input_tokens ?? 0);
+  const miss = Math.max(0, prompt - cached);
+  return (miss / 1e6) * config.priceInputPerM + (cached / 1e6) * config.priceCacheReadPerM;
+}
 
 function buildPingBody(recordedBuffer) {
   // 2026-10-15 实测(Kimi coding 端点): max_tokens=1 的请求不参与前缀缓存(连发双 miss),
@@ -185,6 +207,19 @@ function runPing(key) {
   if (!rec) return;
 
   // 并发保护：该 key 的真实请求 lastSeen <10s 时本次重放顺延 30s
+  // 空闲截断（2026-10-20，对齐社区 maxidle）：距最后一次真实请求超过上限即停止探测，
+  // 避免用户离开后无限期烧钱。0 = 不设限。
+  if (config.maxIdleMin > 0 && rec.lastSeenMs
+      && Date.now() - rec.lastSeenMs > config.maxIdleMin * 60 * 1000) {
+    pingState.on = false;
+    pingState.health = 'stale';
+    pingState.stale = true;
+    if (pingTimers.has(key)) { clearInterval(pingTimers.get(key)); pingTimers.delete(key); }
+    if (pingState.retryTimer) { clearTimeout(pingState.retryTimer); pingState.retryTimer = null; }
+    console.log(`[ping] key=${key} AUTO-OFF: idle beyond ${config.maxIdleMin}min since last real request`);
+    return;
+  }
+
   // (immediate ping / retry / 周期 ping 一律遵守)
   const now = Date.now();
   if (now - rec.lastSeenMs < config.recencyWindowMs) {
@@ -225,6 +260,21 @@ function runPing(key) {
     pingState.pingCount = (pingState.pingCount || 0) + 1;
     pingState.consecutiveTransportFailures = (pingState.consecutiveTransportFailures || 0) + 1;
     pingState.lastError = errStr;
+
+    // 急停（2026-10-20，对齐社区 pi-kimi-keepalive）：
+    // 401/403 = 凭据/配额问题，重试无意义 -> 立即 off；
+    // 其余（429/5xx/超时）累计到 transportFailLimit 才 off，避免偶发抖动误杀。
+    const fatal = statusCode === 401 || statusCode === 403;
+    const exhausted = pingState.consecutiveTransportFailures >= config.transportFailLimit;
+    if (fatal || exhausted) {
+      pingState.stale = true;
+      pingState.health = 'stale';
+      pingState.on = false;
+      if (pingTimers.has(key)) { clearInterval(pingTimers.get(key)); pingTimers.delete(key); }
+      if (pingState.retryTimer) { clearTimeout(pingState.retryTimer); pingState.retryTimer = null; }
+      console.log(`[ping] key=${key} AUTO-OFF: ${fatal ? 'fatal auth/quota error ' + errStr : config.transportFailLimit + ' consecutive transport failures'}`);
+      return;
+    }
     log({
       ts: new Date().toISOString(),
       path: rec.path,
@@ -281,6 +331,19 @@ function runPing(key) {
         pingState.health = result; // 'hit' | 'recreated' | 'no-cache'
         pingState.consecutiveTransportFailures = 0;
         pingState.retryCount = 0;
+
+        // 花费上限（2026-10-20）：累计估算成本，达到上限立即急停
+        const cost = estimatePingCostUsd(usage);
+        pingState.spentUsd = (pingState.spentUsd || 0) + cost;
+        if (config.spendCapUsd > 0 && pingState.spentUsd >= config.spendCapUsd) {
+          pingState.stale = true;
+          pingState.health = 'stale';
+          pingState.on = false;
+          if (pingTimers.has(key)) { clearInterval(pingTimers.get(key)); pingTimers.delete(key); }
+          if (pingState.retryTimer) { clearTimeout(pingState.retryTimer); pingState.retryTimer = null; }
+          console.log(`[ping] key=${key} AUTO-OFF: spend cap reached ($${pingState.spentUsd.toFixed(4)} >= $${config.spendCapUsd})`);
+          return;
+        }
 
         if (result === 'no-cache') {
           // 2xx 但命中率低于门槛（或读写皆 0）：算一次 cache 失败。
@@ -356,6 +419,7 @@ const server = http.createServer((req, res) => {
         pingCount: p.pingCount,
         stale: p.stale,
         health: p.health || null,
+        spentUsd: Number((p.spentUsd || 0).toFixed(4)),
         waitingForRequest: p.waitingForRequest === true,
         retryCount: p.retryCount || 0,
         lastError: p.lastError || null,
@@ -384,7 +448,7 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'invalid-key' }));
         return;
       }
-      let intervalMin = body.intervalMin !== undefined ? Number(body.intervalMin) : 50;
+      let intervalMin = body.intervalMin !== undefined ? Number(body.intervalMin) : 45;
       if (!Number.isInteger(intervalMin) || intervalMin < 1 || intervalMin > 720) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'invalid-interval' }));
@@ -410,6 +474,7 @@ const server = http.createServer((req, res) => {
           retryTimer: null,
           consecutiveZeroCacheRead: prev.consecutiveZeroCacheRead || 0,
           consecutiveTransportFailures: 0,
+          spentUsd: prev.spentUsd || 0,
         });
         res.writeHead(409, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
@@ -477,6 +542,7 @@ const server = http.createServer((req, res) => {
         retryTimer: null,
         consecutiveZeroCacheRead: existing.consecutiveZeroCacheRead || 0,
         consecutiveTransportFailures: 0,
+        spentUsd: existing.spentUsd || 0,
       };
       pings.set(key, state);
       const timer = setInterval(() => runPing(key), intervalMin * 60 * 1000);
