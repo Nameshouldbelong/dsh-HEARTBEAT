@@ -248,8 +248,9 @@ export function apply(ctx) {
           const sessionsList = [];
           const seen = new Set();
 
-          // 优先合并 state.json 中已知会话
+          // 优先合并 state.json 中属于活跃集合的已知会话
           for (const [id, s] of Object.entries(state.sessions || {})) {
+            if (!activeIds.has(id)) continue;
             seen.add(id);
             sessionsList.push({
               sessionId: id,
