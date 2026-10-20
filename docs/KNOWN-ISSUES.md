@@ -73,3 +73,28 @@ stale/waiting → 返回 `alreadyOn:true, immediatePing:false`，不动任何
 
 **生产验证**：修复部署后本会话 key 经 KI-3 轮换自愈（e638b59e，
 cache_read=270k，hit），无每分钟白 ping。
+
+## KI-6：TTL 注入协议错配导致心跳烧光 5h 配额（✅ 已修复，2026-10-20）
+
+**症状**：用户未使用期间 Kimi 5h 配额被打满；HB tab 显示 `ON · NO-CACHE`。
+
+**实测损失**：137 次 ping 中 12 次 no-cache（264 万 token 全价）+ 52 次"伪 hit"
+（cached 仅 4.4%，约 1445 万 token 全价）≈ **1700 万 token 白烧**。
+
+**根因（三处叠加）**：
+1. **TTL 注入协议错配（主因）**：sidecar 注入顶层 `cache_control`（Anthropic
+   Messages 写法）。10-19 pi-ai 将 kimi-coding 切到 openai-completions 后该字段被
+   端点忽略 → 实际按默认 5m TTL。证据：同前缀真实对话命中 99.2%，32-50 分钟后
+   的 ping 全部 0%。官方文档：Chat Completions 用
+   `prompt_cache_options:{mode:'implicit',ttl:'1h'}`。
+2. **hit 判据过松**：只判 `cache_read>0`，4.4% 命中率也报 hit，UI 显示健康而实际
+   94.6% 全价重算。
+3. **失败保护失效**：`/control/on` 每次归零失败计数（reconciler 每分钟补挂），且
+   50min 周期需 150 分钟才凑够 3 次。
+
+**修复**：① `injectCacheTtl()` 按协议分派（真实请求与 ping 共用）；② 命中率门槛
+`hitRatioMin`（默认 5%，`HIT_RATIO_MIN` 可调）；③ `failThreshold` 默认 1——单次
+低命中即置 stale 并**自动 off**（停 timer/retry）；④ 补挂继承失败计数。
+
+**验证**：单测 28/28；生产注入字段实测为 `prompt_cache_options=1h`。
+**待验证**：TTL 1h 实际生效性需配额恢复后用真实 ping 确认（当前配额已耗尽）。
