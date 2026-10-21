@@ -505,7 +505,7 @@ function loadPersistedPings() {
       pings.set(key, {
         key,
         on: true,
-        intervalMin: v.intervalMin || 45,
+        intervalMin: v.intervalMin || 30,
         lastPingAt: v.lastPingAt || null,
         pingCount: v.pingCount || 0,
         stale: false,
@@ -520,7 +520,7 @@ function loadPersistedPings() {
         spentUsd: v.spentUsd || 0,
       });
       if (hasBody) {
-        const timer = setInterval(() => runPing(key), (v.intervalMin || 45) * 60 * 1000);
+        const timer = setInterval(() => runPing(key), (v.intervalMin || 30) * 60 * 1000);
         if (timer.unref) timer.unref();
         pingTimers.set(key, timer);
         restored++;
@@ -878,10 +878,37 @@ function runPing(key) {
   upReq.end(pingBody);
 }
 
+// ── 版本与构建自证（2026-10-22 审计 §6-d）─────────────────────────────────
+// 审计指出：部署后无法确认"源码—安装包—运行进程"是否是同一份。
+// healthz 现在返回 buildSha（本文件内容的 sha256 前 12 位）、协议版本与能力清单，
+// 与仓库 HEAD 的 sidecar.js 摘要比对即可判断线上跑的是不是刚推的那份。
+const PROTOCOL_VERSION = 'hb2';
+const STARTED_AT = new Date().toISOString();
+const BUILD_SHA = (() => {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex').slice(0, 12);
+  } catch { return 'unknown'; }
+})();
+
 const server = http.createServer((req, res) => {
   if (req.url === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, inject_ttl: INJECT_TTL, inject_affinity: INJECT_AFFINITY, upstream: getUpstreamHost() + getUpstreamPrefix() }));
+    res.end(JSON.stringify({
+      ok: true,
+      inject_ttl: INJECT_TTL,
+      inject_affinity: INJECT_AFFINITY,
+      upstream: getUpstreamHost() + getUpstreamPrefix(),
+      // 版本自证
+      protocolVersion: PROTOCOL_VERSION,
+      buildSha: BUILD_SHA,
+      pid: process.pid,
+      startedAt: STARTED_AT,
+      capabilities: [
+        'session-scoped-key', 'control-verify', 'selfcheck',
+        'persist-bodies', 'persist-pings', 'single-inflight',
+        'usage-normalized',
+      ],
+    }));
     return;
   }
 

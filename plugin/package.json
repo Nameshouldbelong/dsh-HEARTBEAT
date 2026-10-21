@@ -1,6 +1,6 @@
 {
   "name": "dsh-heartbeat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Session-level LLM prefix-cache keep-alive for DSH: HEARTBEAT tab + TG duty slash commands (/HTON /HTOFF /HTO)",
   "type": "module",
   "main": "lib/index.mjs",
@@ -24,5 +24,12 @@
     ".": "./lib/index.mjs",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
+  },
+  "engines": {
+    "dsh": ">=0.2.0"
+  },
+  "heartbeat": {
+    "protocolVersion": "hb2",
+    "sidecarProtocol": "hb2"
   }
 }

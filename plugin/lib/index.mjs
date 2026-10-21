@@ -91,7 +91,7 @@ export function getDutyTargetSessionId(ctx) {
   return 'telegram-duty';
 }
 
-function hookTelegramDutyCommands(statePath) {
+function hookTelegramDutyCommands(statePath, ctx) {
   const base = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== '' ? process.env.DSH_HOME : path.join(os.homedir(), '.dsh');
   const candidates = [];
   try {
@@ -108,10 +108,16 @@ function hookTelegramDutyCommands(statePath) {
     if (!fs.existsSync(c)) continue;
     import(c).then(({ CommandRegistry }) => {
       if (!CommandRegistry || !CommandRegistry.prototype) return;
-      if (CommandRegistry.prototype._hbPatched) { hooked++; return; }
-      CommandRegistry.prototype._hbPatched = true;
-      const origResolve = CommandRegistry.prototype.resolve;
-      CommandRegistry.prototype.resolve = function (cmdName) {
+      // 2026-10-22 审计 §6-c：旧实现只打补丁、从不还原，且 `_hbPatched` 会
+      // 让热重载后的新闭包不生效（仍指向旧 statePath）。改为：
+      //   · 首次安装时保存原型上的**原始** resolve 到 shell 对象；
+      //   · 每次加载都把包装层替换成最新闭包（热重载即生效）；
+      //   · 返回 dispose，由 ctx.effect 在插件卸载时还原原型。
+      const shell = CommandRegistry.prototype._hbShell || (CommandRegistry.prototype._hbShell = {
+        originalResolve: CommandRegistry.prototype.resolve,
+      });
+      const origResolve = shell.originalResolve;
+      const wrappedResolve = function (cmdName) {
         const lower = String(cmdName || '').toLowerCase();
         if (lower === 'hton') {
           return {
@@ -142,7 +148,16 @@ function hookTelegramDutyCommands(statePath) {
         }
         return origResolve.call(this, cmdName);
       };
+      CommandRegistry.prototype.resolve = wrappedResolve;
       hooked++;
+      // 卸载时还原原型（若已是别人的补丁则不强改，避免踩踏）
+      if (ctx && typeof ctx.effect === 'function') {
+        ctx.effect(() => () => {
+          if (CommandRegistry.prototype.resolve === wrappedResolve) {
+            CommandRegistry.prototype.resolve = origResolve;
+          }
+        });
+      }
       console.log('[dsh-heartbeat] duty command hook installed:', c);
     }).catch((e) => console.warn('[dsh-heartbeat] duty hook import failed:', c, String(e)));
   }
@@ -217,7 +232,7 @@ export function apply(ctx) {
   } catch {}
 
   // 2. 挂接 Telegram duty 斜杠指令
-  hookTelegramDutyCommands(statePath);
+  hookTelegramDutyCommands(statePath, ctx);
 
   // 3. 注册 DSH 平台命令 (/hton, /htoff, /hto)
   const registerCommands = (cmdCtx) => {
@@ -416,10 +431,28 @@ export function apply(ctx) {
           }
           let text;
           if (on) {
+            // 2026-10-22 审计 §6-b：必须先**校验区间**再执行任何副作用。
+            // 旧实现先 executeHto（非法间隔只返回一句错误文本、不落盘）紧接着
+            // executeHton —— 于是"间隔非法"被后续成功开启掩盖，用户以为生效了。
             if (intervalMin !== undefined) {
+              const parsed = parseHtoParam(String(intervalMin));
+              if (!parsed.valid) {
+                sendJson(res, 400, { error: '非法间隔：' + (parsed.error || String(intervalMin)) });
+                return;
+              }
               await executeHto(String(intervalMin), sessionId, statePath);
             }
             text = await executeHton(sessionId, statePath);
+            // 开启被拒（verify 不通过 / sidecar 不可达）时如实回报，不返回 200
+            const after = readState(statePath).sessions[sessionId];
+            if (!after || after.on !== true) {
+              sendJson(res, 409, {
+                error: (after && after.verifyError) || '保温未能开启',
+                text,
+                session: after,
+              });
+              return;
+            }
           } else {
             text = await executeHtoff(sessionId, statePath);
           }

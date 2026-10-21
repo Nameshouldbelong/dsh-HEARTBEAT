@@ -269,3 +269,52 @@ test('Test 8b: sessionQuery 缺少 readTitleSnapshots（旧版 DSH）-> title=nu
     fs.rmSync(tmpStateFile, { force: true });
   }
 });
+
+test('审计§6-b: toggle 的非法间隔必须先被拒绝，且不得顺手把保温开启', async (t) => {
+  // 复用文件内已有的 fake sidecar / mock ctx 装配方式（见上方主测试）
+  await startFakeSidecar(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hb-toggle-'));
+  const statePath = path.join(dir, 'state.json');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let webHandler = null;
+  const ctx = {
+    effect(fn) { const d = fn(); if (typeof d === 'function') t.after(d); },
+    on() {},
+    webServer: { register({ path: p, handler }) { if (p === '/heartbeat') webHandler = handler; } },
+    commands: { register() {} },
+    sessionQuery: {
+      async listSessions() { return [{ header: { id: 'test-session-1' } }]; },
+      async readTitleSnapshots() { return new Map(); },
+    },
+  };
+  apply(ctx);
+
+  // mockRes 是主测试内的局部函数，这里内联等价实现
+  const res = {
+    statusCode: 200,
+    body: '',
+    result: null,
+    setHeader() {},
+    writeHead(code) { this.statusCode = code; },
+    end(b) {
+      this.body = b;
+      let json = null;
+      try { json = JSON.parse(b); } catch {}
+      this.result = { statusCode: this.statusCode, json };
+      return this;
+    },
+  };
+  await webHandler({
+    method: 'POST',
+    url: '/heartbeat/api/toggle',
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from(JSON.stringify({ sessionId: 'test-session-1', on: true, intervalMin: 9999 }), 'utf8');
+    },
+  }, res);
+
+  assert.ok(res.result, 'handler 应已返回响应');
+  assert.equal(res.result.statusCode, 400, '非法间隔必须返回 400');
+  const st = readState(statePath);
+  assert.notEqual(st.sessions['test-session-1']?.on, true,
+    '❗非法间隔被拒时，绝不能因为后续 HTON 而变成开启状态');
+});

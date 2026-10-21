@@ -235,7 +235,7 @@ function createHeartbeatClient(React) {
     const handleToggle = async (sessionId, currentlyOn, currentInterval) => {
       const nextOn = !currentlyOn;
       try {
-        await fetch('/heartbeat/api/toggle', {
+        const res = await fetch('/heartbeat/api/toggle', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
@@ -244,6 +244,19 @@ function createHeartbeatClient(React) {
             intervalMin: Number(inputValues[sessionId] || currentInterval || 30),
           }),
         });
+        // 2026-10-22 审计 §6-b：旧实现不检查 res.ok —— 服务端拒绝开启
+        // （verify 失败 / 间隔非法 / sidecar 不可达）时界面照样刷新，
+        // 用户看不到任何原因，会误以为已开启。这正是"假健康"的入口之一。
+        if (!res.ok) {
+          let detail = `HTTP ${res.status}`;
+          try {
+            const body = await res.json();
+            detail = body?.error || body?.message || body?.reason || detail;
+          } catch {}
+          alert('开启/关闭心跳失败：' + detail);
+          await fetchState();
+          return;
+        }
         await fetchState();
       } catch (err) {
         alert('切换心跳状态失败: ' + String(err));
@@ -253,10 +266,12 @@ function createHeartbeatClient(React) {
     const handleIntervalChange = (sessionId, val) => {
       setInputValues((prev) => ({ ...prev, [sessionId]: val }));
       const num = Number(val);
-      if (num >= 60) {
+      // 2026-10-22：阈值与后端 /HTO 告警对齐（实测缓存存活 28–45min，
+      // 不是官方 1h TTL；≥40min 就很可能在两次 ping 之间过期）
+      if (num >= 40) {
         setWarningMap((prev) => ({
           ...prev,
-          [sessionId]: '⚠️ 间隔≥60min，1h TTL 缓存会在 ping 间过期',
+          [sessionId]: '⚠️ 间隔≥40min：实测缓存存活约 28–45min，可能在 ping 之间过期',
         }));
       } else {
         setWarningMap((prev) => {
@@ -274,11 +289,21 @@ function createHeartbeatClient(React) {
         return;
       }
       try {
-        await fetch('/heartbeat/api/interval', {
+        const res = await fetch('/heartbeat/api/interval', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ sessionId, intervalMin: val }),
         });
+        if (!res.ok) {
+          let detail = `HTTP ${res.status}`;
+          try {
+            const body = await res.json();
+            detail = body?.error || body?.message || body?.reason || detail;
+          } catch {}
+          alert('更新心跳间隔失败：' + detail);
+          await fetchState();
+          return;
+        }
         await fetchState();
       } catch (err) {
         alert('更新心跳间隔失败: ' + String(err));
