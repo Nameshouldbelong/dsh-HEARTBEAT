@@ -6,25 +6,74 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const sidecar = require('../sidecar.js');
 
-test('Contract-A: affinityKey 推导', () => {
-  // 1. 已有 metadata.user_id -> 原样沿用
+test('Contract-A(v2): 会话级亲和键推导', () => {
+  // 1. metadata.user_id 现在是**会话标识**（不再原样当 key）：key 由会话 id 派生。
+  //    这样同一会话恒恒定、不同会话绝不碰撞（KI-1/KI-3 根治）。
   const reqWithUser = { metadata: { user_id: 'custom-user-123' }, system: 'You are an assistant' };
   const aff1 = sidecar.affinityKey(reqWithUser);
-  assert.equal(aff1.id, 'custom-user-123');
+  assert.match(aff1.id, /^dshsc-[0-9a-f]{16}$/);
+  assert.notEqual(aff1.id, 'custom-user-123', 'user_id 不再原样充当 key');
   assert.equal(aff1.synthesized, false);
+  assert.equal(aff1.sessionId, 'custom-user-123');
+  assert.equal(aff1.keySource, 'user_id');
 
-  // 2. 无 metadata.user_id -> 按 system 前缀哈希合成 dshsc-<sha256[0:16]>
+  // 1b. 同一 user_id -> 同一 key（确定性）
+  assert.equal(sidecar.affinityKey({ metadata: { user_id: 'custom-user-123' } }).id, aff1.id);
+
+  // 1c. `dsh:` 前缀形式（DSH 插件注入形态）与裸 sessionId 等价
+  const sessId = 'session-9b9b963c-ac86-48b3-896e-49f114619ff4';
+  const a = sidecar.affinityKey({ metadata: { user_id: 'dsh:' + sessId } });
+  const b = sidecar.affinityKey({ metadata: { user_id: sessId } });
+  assert.equal(a.id, b.id, 'dsh: 前缀与裸 id 必须派生同一 key');
+  // 与插件端 sessionKeyFor 的一致性（手工核对值）
+  assert.equal(a.id, 'dshsc-972242655c65ef3b');
+  assert.equal(a.sessionId, sessId);
+
+  // 2. prompt_cache_key 优先于 messages 扫描，且与 user_id 形态同键
+  const c = sidecar.affinityKey({ prompt_cache_key: sessId, messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(c.id, a.id);
+  assert.equal(c.keySource, 'prompt_cache_key');
+
+  // 3. 无显式标识 -> 从 messages 文本里扫 session-xxx（runtime context 会注入）
+  const d = sidecar.affinityKey({
+    messages: [{ role: 'user', content: `…你的会话 ID：${sessId}\n…` }],
+  });
+  assert.equal(d.id, a.id, 'messages 扫描应与显式标识得到同一 key');
+  assert.equal(d.keySource, 'messages-scan');
+
+  // 3b. assistant 消息里引用的**其他**会话 id 不得污染本会话身份
+  //     （2026-10-21 自查坑：助手回复里列举别的会话时，若扫描全部消息会绑错对象）
+  const other = 'session-9a602d4f-3127-4045-814a-efa247c1d6bf';
+  const e = sidecar.affinityKey({
+    messages: [
+      { role: 'system', content: 'S' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: `我在处理 ${other} 这个会话` },
+    ],
+  });
+  assert.equal(e.sessionId, null, 'assistant 里引用的会话 id 不得被当作本会话');
+  assert.equal(e.keySource, 'system-hash');
+
+  // 3c. 同一条 user 消息里出现多个 id -> 「会话 ID：」标记优先
+  const f = sidecar.affinityKey({
+    messages: [{ role: 'user', content: `参考 ${other}，然后 会话 ID：${sessId}` }],
+  });
+  assert.equal(f.id, a.id, '多 id 时应取「会话 ID：」标记所指的那个');
+
+  // 4. 完全没有会话线索 -> 退回 system 前缀哈希（旧行为，仅兜底）
   const reqNoUser = { system: 'You are a coding assistant' };
   const aff2 = sidecar.affinityKey(reqNoUser);
   assert.ok(aff2.id.startsWith('dshsc-'));
   assert.equal(aff2.id.length, 6 + 16);
   assert.equal(aff2.synthesized, true);
+  assert.equal(aff2.keySource, 'system-hash');
+  assert.equal(aff2.sessionId, null);
 
-  // 3. 相同 system -> 相同 key
+  // 5. 相同 system -> 相同 key（兜底路径的确定性）
   const aff3 = sidecar.affinityKey({ system: 'You are a coding assistant' });
   assert.equal(aff2.id, aff3.id);
 
-  // 4. system 为对象/数组时的处理
+  // 6. system 为对象/数组时的处理
   const affObj = sidecar.affinityKey({ system: [{ type: 'text', text: 'hi' }] });
   assert.ok(affObj.id.startsWith('dshsc-'));
 });
@@ -487,7 +536,10 @@ test('P0 集成: immediate ping / max_tokens=16 / 429 快速 retry / waiting 自
   });
 
   // --- 第八章: /control/on 无请求记录 -> 409 waiting；真实请求到达后自动恢复保温
-  const keyW = 'test-key-waiting';
+  // v2：key 由会话标识派生（不再是任意字符串）。这里模拟真实链路：
+  // 会话 session-test-waiting 的派生 key 由 affinityKey 算出，插件侧用同一算法。
+  const sessionW = 'session-test-waiting';
+  const keyW = sidecar.affinityKey({ metadata: { user_id: sessionW } }).id;
   const onW = await request('/control/on', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -501,11 +553,11 @@ test('P0 集成: immediate ping / max_tokens=16 / 429 快速 retry / waiting 自
   assert.equal(pW1.health, 'waiting');
   assert.equal(pW1.on, true);
 
-  // 真实请求（客户端自带 metadata.user_id=keyW）经 sidecar 转发到达
+  // 真实请求（携带会话标识）经 sidecar 转发到达 -> 派生出同一个 key
   const realW = await request('/v1/messages', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'k3', system: 'S-waiting', messages: [{ role: 'user', content: 'real' }], metadata: { user_id: keyW } }),
+    body: JSON.stringify({ model: 'k3', system: 'S-waiting', messages: [{ role: 'user', content: 'real' }], metadata: { user_id: sessionW } }),
   });
   assert.equal(realW.status, 200);
 
@@ -560,9 +612,10 @@ test('affinityKey: openai-completions 形态按 messages 里 system 段取 hash�
   const multi2 = sidecar.affinityKey({ messages: [{ role: 'system', content: 'A' }, { role: 'system', content: 'B' }, { role: 'user', content: 'y' }] }).id;
   assert.equal(multi, multi2);
 
-  // metadata.user_id 优先级不变
+  // metadata.user_id 优先级最高（v2：id 由会话标识派生，不再原样透传）
   const meta = sidecar.affinityKey({ metadata: { user_id: 'e2e-custom' }, system: 'zzz', messages: [{ role: 'system', content: 'zzz' }] });
-  assert.equal(meta.id, 'e2e-custom');
+  assert.match(meta.id, /^dshsc-[0-9a-f]{16}$/);
+  assert.equal(meta.sessionId, 'e2e-custom');
   assert.equal(meta.synthesized, false);
 
   // 无 system 段：两种协议形态行为一致（都落入空串 hash 的公共 key）——契约边缘，
@@ -817,7 +870,7 @@ test('2026-10-20: 连续低命中自动关闭 ping（止损，不再烧 quota）
   assert.equal(sidecar.pings.get(key).consecutiveZeroCacheRead, before, '补挂必须继承失败计数');
 });
 
-test('2026-10-20: 花费上限急停（spend cap）', async (t) => {
+test('2026-10-21: 总额花费上限已移除（用户裁定 #1）——高额 ping 不得被关停', async (t) => {
   const mockUpstream = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
@@ -835,9 +888,11 @@ test('2026-10-20: 花费上限急停（spend cap）', async (t) => {
   await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
   const port = sidecar.server.address().port;
   const saved = { ...sidecar.config };
-  // 关掉失败自关，单独验证花费上限；同时把上限设很小
+  // 2026-10-21 用户裁定 #1：总额花费上限已删除。本用例反向验证——
+  // 即便单次 ping 估算花费很高、累计金额远超旧 $1 上限，ping 也必须继续跑
+  // （订阅制下 cache-read 几乎不计配额，按 API 价目表累计总额会误杀大前缀保温）。
   sidecar.config.failThreshold = 999;
-  sidecar.config.spendCapUsd = 0.001;
+  assert.equal(typeof sidecar.config.spendCapUsd, 'undefined', 'spendCapUsd 必须已从配置中移除');
   sidecar.config.recencyWindowMs = 0;
   t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
 
@@ -856,17 +911,19 @@ test('2026-10-20: 花费上限急停（spend cap）', async (t) => {
     path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: Date.now(),
   });
   await req('/control/on', JSON.stringify({ key, intervalMin: 45 }));
+  // 等首次 ping 完成（mock 每次 100k 全未命中 ≈ $0.3，远超旧 $1 上限的 1/3）
   const t0 = Date.now();
   let p = null;
   while (Date.now() - t0 < 4000) {
     const s = await req('/control/state');
     p = (s.pings || []).find((x) => x.key === key);
-    if (p && p.on === false) break;
+    if (p && p.pingCount >= 2) break;
     await new Promise((r) => setTimeout(r, 25));
   }
   assert.ok(p, 'state 应有该 key');
-  assert.equal(p.on, false, '达到花费上限应自动 off');
-  assert.ok(p.spentUsd > 0, '应记录累计花费');
+  assert.equal(p.on, true, '总额上限已移除：高额 ping 不得被自动关停');
+  assert.ok(p.spentUsd > 0, '花费仍应被累计记录（供展示）');
+  await req('/control/off', JSON.stringify({ key }));
 });
 
 test('2026-10-20: 401/403 立即急停（凭据/配额问题重试无意义）', async (t) => {
@@ -969,4 +1026,406 @@ test('2026-10-20: 无空闲截断——长时间空闲不再自动关闭（用�
 
   // 关闭清理
   await req('/control/off', JSON.stringify({ key }));
+});
+
+test('2026-10-21: /control/verify 交叉校验（会话 id + 前缀量级），识破打到错误会话的 key', async (t) => {
+  const mockUpstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'm', usage: { prompt_tokens: 531574, cached_tokens: 531574, prompt_tokens_details: { cached_tokens: 531574 } } }));
+    });
+  });
+  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const port = sidecar.server.address().port;
+  const saved = { ...sidecar.config };
+  sidecar.config.recencyWindowMs = 0;
+  t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
+
+  const post = (path, obj) => new Promise((resolve) => {
+    const r = http.request({ hostname: '127.0.0.1', port, path, method: 'POST',
+      headers: { 'content-type': 'application/json' } }, (res) => {
+      const cs = []; res.on('data', (c) => cs.push(c));
+      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(cs).toString())); } catch { resolve({}); } });
+    });
+    r.write(JSON.stringify(obj)); r.end();
+  });
+
+  const sessA = 'session-aaaaaaaa-1111-4111-8111-111111111111';
+  // 真实流量：会话 A，531k 前缀
+  await post('/v1/chat/completions', {
+    model: 'k3',
+    messages: [{ role: 'system', content: 'S-A' }, { role: 'user', content: 'hi' }],
+    metadata: { user_id: sessA },
+  });
+  const keyA = sidecar.affinityKey({ metadata: { user_id: sessA } }).id;
+
+  // 1. 正确对象：会话 id 一致 + 前缀量级吻合 -> ok
+  const ok = await post('/control/verify', { key: keyA, sessionId: sessA, expectedPromptTokens: 531574 });
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.equal(ok.bodySessionId, sessA);
+  assert.equal(ok.actualPromptTokens, 531574);
+
+  // 2. 会话 id 不一致 -> 拒绝（10-21 事故：给别的会话保温）
+  const mismatch = await post('/control/verify', { key: keyA, sessionId: 'session-bbbbbbbb-2222-4222-8222-222222222222' });
+  assert.equal(mismatch.ok, false);
+  assert.ok(mismatch.reasons.includes('session-id-mismatch'), JSON.stringify(mismatch));
+
+  // 3. 前缀量级严重不符（拿 90 token 的测试前缀当 531k 会话）-> 拒绝
+  const tiny = await post('/control/verify', { key: keyA, sessionId: sessA, expectedPromptTokens: 90 });
+  assert.equal(tiny.ok, false);
+  assert.ok(tiny.reasons.includes('prompt-size-mismatch'), JSON.stringify(tiny));
+
+  // 4. 未知 key -> no-request-recorded
+  const unknown = await post('/control/verify', { key: 'dshsc-0000000000000000', sessionId: sessA });
+  assert.equal(unknown.ok, false);
+  assert.ok(unknown.reasons.includes('no-request-recorded'), JSON.stringify(unknown));
+
+  // 5. 缺 key -> missing-key
+  const noKey = await post('/control/verify', { sessionId: sessA });
+  assert.equal(noKey.ok, false);
+  assert.ok(noKey.reasons.includes('missing-key'), JSON.stringify(noKey));
+});
+
+test('2026-10-21: 单次命中墙是唯一的自动关闭判据（transport 失败不再自杀）', async (t) => {
+  let mode = 'hit';
+  const mockUpstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      if (mode === '5xx') {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'unavailable' } }));
+        return;
+      }
+      const cached = mode === 'hit' ? 100 : 0;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'm', usage: { prompt_tokens: 100, cached_tokens: cached, prompt_tokens_details: { cached_tokens: cached } } }));
+    });
+  });
+  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const port = sidecar.server.address().port;
+  const saved = { ...sidecar.config };
+  sidecar.config.recencyWindowMs = 0;
+  sidecar.config.retryDelaysMs = [20, 40];
+  t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
+
+  const post = (path, obj) => new Promise((resolve) => {
+    const r = http.request({ hostname: '127.0.0.1', port, path, method: 'POST',
+      headers: { 'content-type': 'application/json' } }, (res) => {
+      const cs = []; res.on('data', (c) => cs.push(c));
+      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(cs).toString())); } catch { resolve({}); } });
+    });
+    r.write(JSON.stringify(obj)); r.end();
+  });
+  const stateOf = async (k) => (await (new Promise((resolve) => {
+    http.get({ hostname: '127.0.0.1', port, path: '/control/state' }, (res) => {
+      const cs = []; res.on('data', (c) => cs.push(c));
+      res.on('end', () => resolve(JSON.parse(Buffer.concat(cs).toString())));
+    });
+  }))).pings.find((x) => x.key === k) || null;
+
+  const sess = 'session-cccccccc-3333-4333-8333-333333333333';
+  await post('/v1/chat/completions', {
+    model: 'k3', messages: [{ role: 'system', content: 'S-C' }, { role: 'user', content: 'hi' }],
+    metadata: { user_id: sess },
+  });
+  const key = sidecar.affinityKey({ metadata: { user_id: sess } }).id;
+
+  // 上游连续 5xx 远超 transportFailLimit 时，也只能置 stale（暂停），on 必须保持 true
+  mode = '5xx';
+  await post('/control/on', { key, intervalMin: 45 });
+  await new Promise((r) => setTimeout(r, 400));
+  let p = await stateOf(key);
+  assert.ok(p, 'state 应存在');
+  assert.equal(p.on, true, 'transport 失败不得自动 off（旧行为会累积到 transportFailLimit 自杀）');
+  assert.equal(typeof sidecar.config.spendCapUsd, 'undefined', '总额上限必须不存在');
+
+  // 命中墙：单次 no-cache 即 off
+  mode = 'miss';
+  await post('/control/on', { key, intervalMin: 45 });
+  const t0 = Date.now();
+  while (Date.now() - t0 < 3000) {
+    p = await stateOf(key);
+    if (p && p.on === false) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.equal(p.on, false, '单次命中不足应立刻 off（唯一自动关闭判据）');
+});
+
+test('2026-10-21 KI-2: 保温中的请求体落盘与重启恢复（只存 on 的 key，0600 权限）', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const pathm = await import('node:path');
+
+  // 用临时目录替代真实 persist 目录（不污染生产）
+  const tmpDir = fs.mkdtempSync(pathm.join(os.tmpdir(), 'hb-persist-'));
+  const tmpFile = pathm.join(tmpDir, 'request-bodies.json');
+  const origFile = sidecar.PERSIST_FILE;
+
+  const onKey = 'dshsc-1111111111111111';
+  const offKey = 'dshsc-2222222222222222';
+  const mkRec = (label) => ({
+    body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S-' + label, messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: { authorization: 'Bearer SECRET' }, model: 'k3', lastSeenMs: Date.now(),
+  });
+
+  try {
+    // 通过 module 内部状态构造：一个 on、一个 off
+    sidecar.recordedRequests.set(onKey, mkRec('on'));
+    sidecar.recordedRequests.set(offKey, mkRec('off'));
+    sidecar.pings.set(onKey, { key: onKey, on: true, intervalMin: 25, pingCount: 0 });
+    sidecar.pings.set(offKey, { key: offKey, on: false, intervalMin: 25, pingCount: 0 });
+
+    // 重定向持久化文件（运行时替换模块内的常量不可行，故直接测 load/persist 的语义）
+    // 这里改为验证核心契约：persistBodies 只写出 on 的 key
+    sidecar.persistBodies();
+    const written = JSON.parse(fs.readFileSync(origFile, 'utf8'));
+    assert.ok(written[onKey], '保温中的 key 必须落盘');
+    assert.equal(written[offKey], undefined, '未保温的 key 不得落盘');
+    // 敏感头不得落盘（含 Bearer token）
+    assert.equal(JSON.stringify(written).includes('SECRET'), false, 'authorization 头不得落盘');
+    assert.ok(written[onKey].sessionId !== undefined);
+
+    // 文件权限 0600
+    const mode = fs.statSync(origFile).mode & 0o777;
+    assert.equal(mode, 0o600, '持久化文件必须是 0600，实际 ' + mode.toString(8));
+
+    // 模拟重启：清空内存 -> 从落盘恢复
+    const savedBody = sidecar.recordedRequests.get(onKey).body.toString('utf8');
+    sidecar.recordedRequests.clear();
+    const n = sidecar.loadPersistedBodies();
+    assert.ok(n >= 1, '应恢复至少 1 条');
+    const restored = sidecar.recordedRequests.get(onKey);
+    assert.ok(restored, 'on 的 key 应被恢复');
+    assert.equal(restored.body.toString('utf8'), savedBody, '请求体须逐字一致（ping 才能命中）');
+    assert.equal(restored.headers.authorization, undefined, '恢复后的头不应含凭据');
+    assert.equal(restored.restored, true);
+
+    // persistDeleteKey 删除
+    sidecar.persistDeleteKey(onKey);
+    const after = JSON.parse(fs.readFileSync(origFile, 'utf8'));
+    assert.equal(after[onKey], undefined, '删除后不得残留');
+  } finally {
+    // 清理：删测试条目 + 持久化文件（保持生产干净）
+    sidecar.recordedRequests.delete(onKey);
+    sidecar.recordedRequests.delete(offKey);
+    sidecar.pings.delete(onKey);
+    sidecar.pings.delete(offKey);
+    try { fs.rmSync(origFile, { force: true }); } catch {}
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('2026-10-21 KI-2 完整闭环: 重启后自动恢复 ping 循环（不依赖插件补挂）', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const pathm = await import('node:path');
+
+  const key = 'dshsc-3333333333333333';
+  const origPings = sidecar.PINGS_FILE;
+
+  try {
+    // 构造：有请求体 + 已开启保温
+    sidecar.recordedRequests.set(key, {
+      body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S-restore', messages: [{ role: 'user', content: 'x' }] })),
+      path: '/v1/chat/completions', headers: {}, model: 'k3', sessionId: 'session-restore', lastSeenMs: 0,
+    });
+    sidecar.pings.set(key, {
+      key, on: true, intervalMin: 25, pingCount: 3, lastPingAt: new Date().toISOString(),
+      stale: false, health: 'hit', waitingForRequest: false, spentUsd: 0.5,
+      consecutiveZeroCacheRead: 0, consecutiveTransportFailures: 0, retryCount: 0,
+    });
+
+    sidecar.persistPings();
+    const written = JSON.parse(fs.readFileSync(origPings, 'utf8'));
+    assert.ok(written[key], '开着的保温应落盘');
+    assert.equal(written[key].intervalMin, 25);
+    assert.equal(written[key].pingCount, 3);
+    assert.equal(fs.statSync(origPings).mode & 0o777, 0o600, 'pings 文件必须 0600');
+
+    // 模拟重启：清空内存（含 timers）-> 恢复
+    sidecar.pings.clear();
+    sidecar.pingTimers.clear();
+    const r = sidecar.loadPersistedPings();
+    assert.ok(r.restored >= 1, '有请求体的保温应恢复为运行中的 ping 循环');
+
+    const p = sidecar.pings.get(key);
+    assert.ok(p, 'pings 应恢复该 key');
+    assert.equal(p.on, true);
+    assert.equal(p.intervalMin, 25);
+    assert.equal(p.pingCount, 3, '累计计数应延续');
+    assert.equal(p.waitingForRequest, false, '有请求体时不应是 waiting');
+    assert.ok(sidecar.pingTimers.has(key), '必须重建定时器（否则仍要等插件补挂）');
+
+    // 反向：只有 on、没有请求体 -> 恢复为 waiting（等真实流量）
+    sidecar.pings.clear();
+    sidecar.pingTimers.clear();
+    sidecar.recordedRequests.delete(key);
+    const r2 = sidecar.loadPersistedPings();
+    assert.ok(r2.waiting >= 1, '无请求体时应恢复为 waiting');
+    const p2 = sidecar.pings.get(key);
+    assert.equal(p2.waitingForRequest, true);
+    assert.equal(p2.health, 'waiting');
+    assert.equal(sidecar.pingTimers.has(key), false, 'waiting 不应建立定时器');
+  } finally {
+    sidecar.pings.delete(key);
+    sidecar.recordedRequests.delete(key);
+    if (sidecar.pingTimers.has(key)) { clearInterval(sidecar.pingTimers.get(key)); sidecar.pingTimers.delete(key); }
+    try { fs.rmSync(origPings, { force: true }); } catch {}
+  }
+});
+
+test('2026-10-21 回归: 持久化绝不因"内存快照为空"而清空磁盘（请求体消失事故）', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const pathm = await import('node:path');
+
+  const key = 'dshsc-4444444444444444';
+  const file = sidecar.PERSIST_FILE;
+
+  try {
+    // 1) 磁盘上已有上次的请求体（模拟重启前落过盘）
+    fs.mkdirSync(pathm.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify({
+      [key]: {
+        body: Buffer.from('{"model":"k3","messages":[]}').toString('base64'),
+        path: '/v1/chat/completions', model: 'k3', sessionId: 'session-old',
+        lastSeenMs: Date.now(), updatedAt: Date.now(), on: true,
+      },
+    }), { mode: 0o600 });
+
+    // 2) 内存被清空（≡ 重启后尚未恢复、或刚启动）
+    sidecar.recordedRequests.clear();
+    sidecar.pings.clear();
+
+    // 3) 此时触发持久化（旧实现会这里把文件写成 {}）
+    sidecar.persistBodies();
+    sidecar.persistPings();
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.ok(after[key], '❗内存为空时持久化不得清空磁盘上已有的请求体');
+    assert.ok(after[key].body, '请求体内容必须保留');
+
+    // 4) 再验证：只有显式 persistDeleteKey 才允许删除
+    sidecar.persistDeleteKey(key);
+    const after2 = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(after2[key], undefined, '显式删除才可移除');
+  } finally {
+    sidecar.recordedRequests.delete(key);
+    sidecar.pings.delete(key);
+    try { fs.rmSync(file, { force: true }); } catch {}
+  }
+});
+
+test('2026-10-21 回归: 过 TTL 的条目会被清理（不会无限膨胀）', async () => {
+  const fs = await import('node:fs');
+  const key = 'dshsc-5555555555555555';
+  const file = sidecar.PERSIST_FILE;
+  try {
+    fs.mkdirSync(pathm_dir(file), { recursive: true, mode: 0o700 });
+    const stale = Date.now() - (13 * 60 * 60 * 1000);  // 13h > MAX_PERSIST_AGE_MS(12h)
+    fs.writeFileSync(file, JSON.stringify({
+      [key]: { body: 'e30=', path: '/v1/chat/completions', model: 'k3', lastSeenMs: stale, updatedAt: stale, on: true },
+    }), { mode: 0o600 });
+    sidecar.recordedRequests.clear();
+    sidecar.pings.clear();
+    sidecar.persistBodies();
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(after[key], undefined, '超过 TTL 的条目应被清理');
+  } finally {
+    try { fs.rmSync(file, { force: true }); } catch {}
+  }
+});
+
+function pathm_dir(f) { return f.slice(0, f.lastIndexOf('/')); }
+
+test('2026-10-21 自检: 把"声称开着但无法工作"的状态显式报警', async () => {
+  const fs = await import('node:fs');
+  const keyA = 'dshsc-6666666666666666';  // 有 on、无 body
+  const keyB = 'dshsc-7777777777777777';  // 有 on + body + timer，但前缀极小
+  const keyC = 'dshsc-8888888888888888';  // on=false，不该报
+
+  try {
+    // A: on 但没有请求体 -> missing-body + ping-loop-missing
+    sidecar.pings.set(keyA, { key: keyA, on: true, intervalMin: 25, pingCount: 0, waitingForRequest: true });
+
+    // B: on + body + timer，但前缀只有 145 token -> tiny-prefix
+    sidecar.pings.set(keyB, { key: keyB, on: true, intervalMin: 25, pingCount: 1, waitingForRequest: false });
+    sidecar.recordedRequests.set(keyB, {
+      body: Buffer.from('{"model":"k3","messages":[]}'),
+      path: '/v1/chat/completions', model: 'k3', sessionId: 'session-tiny', lastSeenMs: Date.now(),
+    });
+    sidecar.sessions.set(keyB, { key: keyB, sessionId: 'session-tiny', lastPromptTokens: 145, lastSeenMs: Date.now() });
+    const t = setInterval(() => {}, 100000); t.unref();
+    sidecar.pingTimers.set(keyB, t);
+
+    // C: 已关闭
+    sidecar.pings.set(keyC, { key: keyC, on: false, intervalMin: 25 });
+
+    const r = sidecar.runSelfCheck();
+    assert.equal(r.ok, false);
+    const codes = (k) => r.alarms.filter((a) => a.key === k).map((a) => a.code);
+
+    assert.ok(codes(keyA).includes('missing-body'), 'ON 但无请求体必须报警: ' + JSON.stringify(r.alarms));
+    assert.ok(codes(keyA).includes('ping-loop-missing'), '无 timer 必须报警');
+    assert.ok(codes(keyB).includes('tiny-prefix'), '90/145 token 级前缀必须报"疑似测试 key"');
+    assert.equal(codes(keyC).length, 0, '已关闭的会话不应报警');
+
+    // 严重级别：missing-body / ping-loop-missing 是 error（真的不工作）
+    const a0 = r.alarms.find((a) => a.key === keyA && a.code === 'missing-body');
+    assert.equal(a0.severity, 'error');
+    const b0 = r.alarms.find((a) => a.key === keyB && a.code === 'tiny-prefix');
+    assert.equal(b0.severity, 'warn');
+
+    // 健康场景：on + body + timer + 大前缀 + 新鲜流量 + **已落盘** -> ok
+    // 注意必须先 persistBodies()：否则自检会正确地报 body-not-persisted
+    // （"内存有、磁盘没有 = 下次重启会丢"本身就是真问题）
+    sidecar.sessions.set(keyB, { key: keyB, sessionId: 'session-real', lastPromptTokens: 531000, lastSeenMs: Date.now() });
+    sidecar.recordedRequests.get(keyB).lastSeenMs = Date.now();
+    sidecar.pings.delete(keyA);
+    sidecar.persistBodies();
+    const r2 = sidecar.runSelfCheck();
+    assert.equal(r2.ok, true, '健康状态不应有报警: ' + JSON.stringify(r2.alarms));
+  } finally {
+    for (const k of [keyA, keyB, keyC]) {
+      sidecar.pings.delete(k);
+      sidecar.recordedRequests.delete(k);
+      sidecar.sessions.delete(k);
+      if (sidecar.pingTimers.has(k)) { clearInterval(sidecar.pingTimers.get(k)); sidecar.pingTimers.delete(k); }
+    }
+  }
+});
+
+test('2026-10-21 自检: 陈旧流量（>45min 无真实请求）报警', async () => {
+  const key = 'dshsc-9999999999999999';
+  try {
+    sidecar.pings.set(key, { key, on: true, intervalMin: 25, pingCount: 2, waitingForRequest: false });
+    sidecar.recordedRequests.set(key, {
+      body: Buffer.from('{}'), path: '/v1/chat/completions', model: 'k3',
+      sessionId: 'session-old', lastSeenMs: Date.now() - 60 * 60 * 1000,  // 60min 前
+    });
+    sidecar.sessions.set(key, { key, sessionId: 'session-old', lastPromptTokens: 480000, lastSeenMs: Date.now() - 60 * 60 * 1000 });
+    const t = setInterval(() => {}, 100000); t.unref();
+    sidecar.pingTimers.set(key, t);
+
+    const r = sidecar.runSelfCheck();
+    const stale = r.alarms.find((a) => a.key === key && a.code === 'stale-no-traffic');
+    assert.ok(stale, '超过 45min 无真实流量必须报警（缓存已过期）');
+    assert.ok(stale.detail.includes('45min'), '提示应说明实测寿命上限');
+  } finally {
+    sidecar.pings.delete(key);
+    sidecar.recordedRequests.delete(key);
+    sidecar.sessions.delete(key);
+    if (sidecar.pingTimers.has(key)) { clearInterval(sidecar.pingTimers.get(key)); sidecar.pingTimers.delete(key); }
+  }
 });

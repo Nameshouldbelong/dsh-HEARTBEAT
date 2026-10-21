@@ -288,7 +288,33 @@ function createHeartbeatClient(React) {
     const sessions = stateData.sessions || [];
     const pingsMap = new Map((stateData.pings || []).map((p) => [p.key, p]));
 
+    // 2026-10-21：sidecar 自检报警。
+    // 目的：别让 waiting / hit 掩盖"实际已失效"——10-21 就是 UI 显示 34 次 hit，
+    // 但保温实际打在 90 token 的测试前缀上。
+    const selfCheck = stateData.selfCheck || null;
+    const alarms = (selfCheck && Array.isArray(selfCheck.alarms)) ? selfCheck.alarms : [];
+    const titleByKey = new Map(sessions.map((s) => [s.key, s.title || String(s.sessionId).slice(0, 18)]));
+
     return h('div', { className: 'hb-container' },
+      alarms.length > 0
+        ? h('div', {
+            className: 'hb-alarm-panel',
+            style: {
+              margin: '0 0 14px', padding: '10px 14px', borderRadius: 8,
+              background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.45)',
+            },
+          },
+          h('div', { style: { fontWeight: 600, color: '#ef4444', marginBottom: 6 } },
+            `⚠️ 保温自检发现 ${alarms.length} 个问题（这些状态下保温不会按预期工作）`),
+          ...alarms.map((a, i) => h('div', {
+            key: 'alarm-' + i,
+            style: { fontSize: 12, marginTop: 4, color: a.severity === 'error' ? '#ef4444' : '#f59e0b' },
+          },
+            `[${a.severity}] ${titleByKey.get(a.key) || a.key} — ${a.code}`,
+            h('div', { style: { color: 'var(--dsh-text-muted, #9ca3af)', marginTop: 2 } }, a.detail)
+          ))
+        )
+        : null,
       h('div', { className: 'hb-header' },
         h('div', null,
           h('h2', { className: 'hb-title' }, '💓 LLM 前缀缓存保温 (HEARTBEAT)'),
@@ -396,11 +422,26 @@ function createHeartbeatClient(React) {
                     h('div', { className: 'hb-mono', style: { fontSize: 11, color: 'var(--dsh-text-muted, #9ca3af)' } },
                       `次数: ${ping?.pingCount || 0} | Cache read: ${ping?.lastUsage?.cache_read_input_tokens || 0}`
                     ),
+                    // 2026-10-21：前缀规模是人工核对「保温对象是否正确」的关键信号。
+                    // 90 token 的测试前缀 vs 500k 的真实会话，一眼可分。
+                    h('div', { className: 'hb-mono', style: { fontSize: 11, color: 'var(--dsh-text-muted, #9ca3af)' } },
+                      `前缀: ${s.promptTokens ? s.promptTokens.toLocaleString() + ' token' : '未观测'}`
+                    ),
                     h('div', { className: 'hb-mono', style: { fontSize: 11, color: 'var(--dsh-text-muted, #9ca3af)' } },
                       `Cache creation: ${ping?.lastUsage?.cache_creation_input_tokens || 0}` +
-                      (ping?.spentUsd > 0 ? ` | 花费≈$${ping.spentUsd}` : '') +
+                      // 花费仅作参考展示：订阅制下 cache-read 几乎不计配额，
+                      // 该数字按 API 价目表估算，**不是** 5h 窗口占用
+                      (ping?.spentUsd > 0 ? ` | 估算花费≈$${ping.spentUsd}` : '') +
                       (ping?.lastError ? ` | 错误: ${ping.lastError}` : '')
-                    )
+                    ),
+                    s.verifyError
+                      ? h('div', { className: 'hb-mono', style: { fontSize: 11, color: '#ef4444' } },
+                          `校验失败: ${s.verifyError}`)
+                      : null,
+                    s.keyDrift
+                      ? h('div', { className: 'hb-mono', style: { fontSize: 11, color: '#f59e0b' } },
+                          `⚠️ key 已纠正（旧: ${s.keyDrift}）`)
+                      : null
                   )
                 );
               })

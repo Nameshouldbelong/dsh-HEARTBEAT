@@ -1,5 +1,11 @@
 # 已知问题（KNOWN ISSUES）
 
+> **2026-10-21 v2 重构后，本文件部分内容已被取代。以
+> [V2-REFACTOR-2026-10-21.md](V2-REFACTOR-2026-10-21.md) 为准。**
+> 主要变化：KI-1/KI-3 已根治（会话级 key）、KI-4 已修复、KI-7 花费上限已移除、
+> transport 失败不再自动 off。以下为历史记录，保留原始症状与根因分析。
+
+
 ## KI-1：session identity 碰撞（P1，待 DSH core 修复）
 
 **现象**：sidecar 亲和键 Contract-A 的 fallback 是 `sha256(system[:8000])`。

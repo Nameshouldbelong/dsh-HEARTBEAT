@@ -19,6 +19,10 @@ async function startFakeSidecar(t) {
         r = { status: 200, json: { sessions: [{ key: 'dshsc-fake', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
       } else if (req.url === '/control/on') {
         r = { status: 200, json: { ok: true, immediatePing: true, state: {} } };
+      } else if (req.url === '/control/verify') {
+        // v2：开启前交叉校验；桩返回 ok 以模拟「该会话确有真实流量」
+        const b = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+        r = { status: 200, json: { ok: true, key: b.key, sessionId: b.sessionId, reasons: [], actualPromptTokens: 1234 } };
       } else if (req.url === '/control/off') {
         r = { status: 200, json: { ok: true } };
       } else if (req.url === '/control/state') {
@@ -55,6 +59,18 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       effect(fn) {
         const disposer = fn();
         if (typeof disposer === 'function') effectDisposers.push(disposer);
+      },
+      // v2：插件订阅 session/event 做标题缓存失效（KI-4 性能 + Rename 即时同步）。
+      // 忠实模拟 DSH：Rename 会 append 一条 session/title 事件。
+      listeners: {},
+      on(evt, fn) {
+        (this.listeners[evt] ||= []).push(fn);
+        return () => {
+          this.listeners[evt] = (this.listeners[evt] || []).filter((f) => f !== fn);
+        };
+      },
+      emit(evt, ...args) {
+        for (const fn of this.listeners[evt] || []) fn(...args);
       },
       webServer: {
         register({ kind, path: routePath, handler }) {
@@ -120,8 +136,9 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
     const s1 = res1.result.json.sessions.find((s) => s.sessionId === 'test-session-1');
     assert.equal(s1.title, 'PRDM2 Analysis');
 
-    // Rename 后下一次查询即同步（不缓存旧名）
+    // Rename 后下一次查询即同步（靠 session/title 事件精确失效缓存，而非纯 TTL）
     titleMap.set('test-session-1', 'PRDM2 TAN Migration');
+    mockCtx.emit('session/event', { id: 'test-session-1' }, { type: 'session/title', data: { title: 'PRDM2 TAN Migration' } });
     const res1b = mockRes();
     await webHandler({ method: 'GET', url: '/heartbeat/api/state' }, res1b);
     const s1b = res1b.result.json.sessions.find((s) => s.sessionId === 'test-session-1');
@@ -167,7 +184,7 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htonRes.kind, 'success');
-    assert.equal(htonRes.text, '💓 心跳已开启（间隔 60min），已立即执行首次保温');
+    assert.ok(htonRes.text.startsWith('💓 心跳已开启（间隔 60min'), htonRes.text);
 
     // 5. 测试平台命令: /hto 30
     const htoCmd = registeredCommands.get('hto');
@@ -176,7 +193,7 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htoRes.kind, 'success');
-    assert.equal(htoRes.text, '💓 心跳间隔已设为 30min 并开启，已立即执行首次保温');
+    assert.ok(htoRes.text.startsWith('💓 心跳间隔已设为 30min 并开启'), htoRes.text);
 
     // 6. 测试平台命令: /hto 60 (>=60min 触发 1h TTL 告警)
     const hto60Res = await htoCmd.handler({
@@ -185,7 +202,7 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
     });
     assert.equal(hto60Res.kind, 'success');
     assert.ok(hto60Res.text.includes('💓 心跳间隔已设为 60min 并开启'));
-    assert.ok(hto60Res.text.includes('⚠️ 间隔≥60min：1h TTL 缓存会在 ping 间过期'));
+    assert.ok(hto60Res.text.includes('⚠️ 间隔≥40min'), hto60Res.text);
 
     // 7. 测试平台命令: /hto invalid (非法参数)
     const htoErrRes = await htoCmd.handler({

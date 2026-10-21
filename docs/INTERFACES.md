@@ -1,14 +1,46 @@
 # 接口契约细节
 
-## Contract-A：亲和键（已实现，勿改）
+## Contract-A：亲和键（v2，2026-10-21 重写）
 
 ```
-若请求体已有 metadata.user_id → key = 该值（原样沿用）
-否则 → key = "dshsc-" + sha256(systemText.slice(0, 8000)).hex.slice(0, 16)
-  systemText = 请求体 system 字段：string 直接用；数组/对象则 JSON.stringify
+key = "dshsc-" + sha256("session:" + sessionId).hex.slice(0, 16)
 ```
 
-语义：同一会话的 system 稳定 → key 稳定；system 变了则前缀本来就要重建，key 变更是正确行为。
+- **两端算法必须逐字一致**：插件 `plugin/lib/keys.mjs:sessionKeyFor()`、
+  sidecar `sidecar/sidecar.js:makeSessionKey()`。任一侧改动即为破坏性变更。
+- key 只由 sessionId 决定，与 system prompt / 模型 / 工具集完全无关：
+  同一会话恒定（system 变化不影响）→ 根治 KI-3；不同会话必不同 → 根治 KI-1。
+
+**sidecar 解析会话身份的优先级**（`keySource` 写入 `/sessions` 与 ping 遥测）：
+
+| # | 来源 | keySource |
+|---|---|---|
+| 1 | 请求体 `prompt_cache_key` | `prompt_cache_key` |
+| 2 | `metadata.user_id`（`dsh:session-x` / 裸 `session-x` / 已是 `dshsc-…`） | `user_id` / `user_id-key` |
+| 3 | **role=user** 消息文本里的 `session-<uuid>` | `messages-scan` |
+| 4 | system 前缀哈希（仅兜底，碰撞风险仍在，勿依赖） | `system-hash` |
+
+> 第 3 条两条硬约束勿改：**只扫 user 消息**（assistant 常引用别的会话 id，会绑错对象）；
+> 同消息多 id 时取「会话 ID：」标记所指。
+
+sidecar 会把解析出的会话标识写回请求体 `metadata.user_id`，供 `/control/verify` 事后反查。
+
+**旧契约已废弃**（勿再实现）：`metadata.user_id` 原样当 key；`sha256(system[:8000])` 作主键；
+插件侧 recency 猜 key；`dshsc-${sessionId.slice(0,16)}` 伪键。
+
+## Contract-A2：保温对象交叉校验
+
+```
+POST /control/verify  { key, sessionId, expectedPromptTokens?, tolerance?=0.25 }
+→ { ok, reasons[], key, sessionId, bodySessionId, actualPromptTokens,
+    expectedPromptTokens, tolerance, lastSeenAt, bodyModel }
+```
+
+`reasons` 取值：`missing-key` / `no-request-recorded` / `unparsable-recorded-body` /
+`session-id-mismatch` / `no-observed-traffic` / `prompt-size-mismatch`。
+
+**插件侧契约**：`ok !== true` → 必须拒绝开启（不写 `on:true`）并向用户如实回报原因。
+这是 2026-10-21 事故（给 90-token 测试 key 保温 34 次却显示 hit）的直接防线。
 
 ## Contract-B：sidecar 控制 API（127.0.0.1:8791）
 

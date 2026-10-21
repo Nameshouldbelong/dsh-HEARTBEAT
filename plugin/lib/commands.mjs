@@ -1,5 +1,11 @@
 import { readState, updateSessionState } from './state.mjs';
-import { sidecarControlOn, sidecarControlOff, sidecarSessions } from './sidecar-client.mjs';
+import {
+  sidecarControlOn,
+  sidecarControlOff,
+  sidecarVerify,
+  sidecarSessions,
+} from './sidecar-client.mjs';
+import { sessionKeyFor } from './keys.mjs';
 
 export function parseHtoParam(input) {
   const usage = '用法：/HTO <分钟>（1-720），如 /HTO 60';
@@ -21,93 +27,110 @@ export function parseHtoParam(input) {
   return { valid: true, minutes: num };
 }
 
-export async function resolveSessionKey(sessionId, statePath, { fresh = false } = {}) {
-  if (!fresh) {
-    const state = readState(statePath);
-    if (state.sessions[sessionId]?.key) {
-      return state.sessions[sessionId].key;
-    }
-  }
-  // 尝试从 sidecar 活跃会话反查
-  try {
-    const list = await sidecarSessions();
-    if (list.length > 0) {
-      const match = list.find((s) => s.key === sessionId || s.key.includes(sessionId));
-      if (match) return match.key;
-      // 最近活跃策略: /HTON 时当前会话刚有过流量, 10min 内最新 lastSeen 的 key 即当前会话
-      const freshList = list
-        .filter((s) => s.lastSeenAt && Date.now() - Date.parse(s.lastSeenAt) < 10 * 60 * 1000)
-        .sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt));
-      if (freshList.length > 0) return freshList[0].key;
-      if (list.length === 1) return list[0].key;
-    }
-  } catch {}
-  throw new Error('unresolved-session: 当前会话没有最近的缓存活动, 先对话一轮再 /HTON');
+// 2026-10-21 v2：key 不再「解析」而是「推导」。
+// 旧实现 resolveSessionKey 有两处致命缺陷，已全部删除：
+//   ① recency 策略——把 sidecar 里 10min 内最新活跃的 key 认作"当前会话"，
+//      多会话并发时必然张冠李戴（10-21 事故：LSD1 被绑到别的会话的 E2E 测试 key）；
+//   ② 兜底伪造——`dshsc-${sessionId.slice(0,16)}` 这种根本不存在的键，
+//      会让 sidecar 进入 waiting 并永远等不到流量，UI 却显示"已开启"。
+// 现在 key 只由 sessionId 确定性派生，两端算法一致，无法漂移也无法猜错。
+export function resolveSessionKey(sessionId) {
+  return sessionKeyFor(sessionId);
 }
 
-// KI-3：dshsc- key = sha256(system[:8000])，system prompt 漂移后同一会话 key 改变，
-// 插件存的旧 key 再也等不到流量（/control/on 409，waiting 卡死）。
-// 检测到「存储 key 409」时按 sidecar 新鲜流量重解析并重试一次。
-// 防抢守卫：fresh key 若已被其他开启中的会话认领，不抢占（避免给错误会话保温）。
-export async function rotateStaleKey(sessionId, statePath, oldKey, intervalMin) {
-  const state = readState(statePath);
-  // 仅当 oldKey 来自插件存储（漂移场景）才尝试轮换
-  if (state.sessions[sessionId]?.key !== oldKey) return null;
-  let fresh;
+/**
+ * 开启前交叉校验（用户裁定 #3）：绝不「假装 ACTIVE」。
+ * 三条判据（任一条不过即拒绝开启，并把原因如实回报给用户）：
+ *   ① sidecar 有该 key 的真实请求记录；
+ *   ② 请求体里的会话标识与本次要保温的 sessionId 一致；
+ *   ③ 观测到的 prompt 规模落在期望区间内（默认 ±25%）。
+ * 第 ③ 条是识破"key 打错对象"最直接的一刀：拿 90 token 的测试前缀当 480k
+ * 会话去保温，量级差 5000 倍，一眼可分。
+ *
+ * @returns {{ok:boolean, result?:object, reason?:string, text:string}}
+ */
+export async function verifyBinding(sessionId, key, { expectedPromptTokens = null, tolerance = 0.25 } = {}) {
+  const res = await sidecarVerify({
+    key,
+    sessionId,
+    expectedPromptTokens,
+    tolerance,
+  }).catch(() => null);
+
+  if (!res || res.status !== 200 || !res.data) {
+    return {
+      ok: false,
+      reason: 'sidecar-unreachable',
+      text: '⚠️ sidecar 未响应，无法校验保温对象；已拒绝开启（不假装 ACTIVE）',
+    };
+  }
+  const r = res.data;
+  if (r.ok) return { ok: true, result: r, text: '' };
+
+  const why = (r.reasons || []).join(', ');
+  const detail = [];
+  if (r.reasons?.includes('no-request-recorded')) {
+    detail.push('sidecar 里还没有本会话的请求记录（先在该会话对话一轮再开）');
+  }
+  if (r.reasons?.includes('session-id-mismatch')) {
+    detail.push(`key 对应的真实会话是 ${r.bodySessionId || '未知'}，与目标 ${sessionId} 不符`);
+  }
+  if (r.reasons?.includes('prompt-size-mismatch')) {
+    detail.push(`观测前缀 ${r.actualPromptTokens} token，期望 ${r.expectedPromptTokens}±${Math.round(tolerance * 100)}%（量级不符，疑似打到别的会话）`);
+  }
+  if (r.reasons?.includes('no-observed-traffic')) {
+    detail.push('该 key 尚无成功流量，无法确认前缀规模');
+  }
+  return {
+    ok: false,
+    reason: why,
+    result: r,
+    text: `⛔ 保温对象校验未通过（${why}）：${detail.join('；')}`,
+  };
+}
+
+/**
+ * 取该会话的期望前缀规模：优先用调用方给的实测值（会话日志里最近一步的
+ * prompt 规模），否则退回 sidecar 侧对**同一 sessionId** 的观测值。
+ */
+async function resolveExpectedPromptTokens(sessionId, key, provided) {
+  if (Number.isFinite(provided) && provided > 0) return provided;
   try {
-    fresh = await resolveSessionKey(sessionId, statePath, { fresh: true });
-  } catch {
-    return null;
-  }
-  if (!fresh || fresh === oldKey) return null;
-  const claimed = Object.entries(state.sessions || {})
-    .some(([id, s]) => id !== sessionId && s.on && s.key === fresh);
-  if (claimed) return null;
-  const res = await sidecarControlOn(fresh, intervalMin).catch(() => null);
-  if (res && res.status === 200) {
-    updateSessionState(statePath, sessionId, { key: fresh, on: true, intervalMin, waiting: false });
-    return { key: fresh };
-  }
+    const list = await sidecarSessions();
+    const hit = list.find((s) => s.sessionId === sessionId && s.key === key);
+    if (hit && Number(hit.lastPromptTokens) > 0) return Number(hit.lastPromptTokens);
+  } catch {}
   return null;
 }
 
-export async function executeHton(sessionId, statePath) {
+export async function executeHton(sessionId, statePath, opts = {}) {
   const state = readState(statePath);
   const current = state.sessions[sessionId];
   const intervalMin = current?.intervalMin || 30;
-  const key = await resolveSessionKey(sessionId, statePath);
+  const key = resolveSessionKey(sessionId);
+
+  const expected = await resolveExpectedPromptTokens(sessionId, key, opts.expectedPromptTokens);
+  const check = await verifyBinding(sessionId, key, { expectedPromptTokens: expected });
+  if (!check.ok) {
+    // 校验失败不写 on:true —— 状态必须与事实一致
+    updateSessionState(statePath, sessionId, { key, on: false, waiting: false });
+    return check.text;
+  }
 
   const res = await sidecarControlOn(key, intervalMin).catch(() => null);
-
-  // sidecar 无该 key 的请求记录（典型：sidecar 重启丢内存）：
-  // 先试 KI-3 key 轮换（存储 key 随 system prompt 漂移失效）；
-  // 轮换不成则说明真无流量，sidecar 已记录保温意图，如实告知不假装 ACTIVE
-  if (res && res.status === 409) {
-    const rotated = await rotateStaleKey(sessionId, statePath, key, intervalMin);
-    if (rotated) {
-      return `💓 心跳已开启（间隔 ${intervalMin}min），已立即执行首次保温`;
-    }
-    updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: true });
-    return `💓 心跳意图已记录（间隔 ${intervalMin}min）：sidecar 暂无本会话请求记录，下一次真实请求到达后自动开始保温`;
-  }
-
-  updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: false });
+  updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: res != null && res.status === 409 });
 
   if (!res || res.status !== 200) {
-    return `⚠️ sidecar 未响应（已记录开启意图，reconciler 每分钟自动补挂，间隔 ${intervalMin}min）`;
+    return `⚠️ sidecar 未响应（已记录开启意图，reconciler 定期自动补挂，间隔 ${intervalMin}min）`;
   }
-
-  return `💓 心跳已开启（间隔 ${intervalMin}min），已立即执行首次保温`;
+  return `💓 心跳已开启（间隔 ${intervalMin}min，前缀 ${check.result?.actualPromptTokens ?? '?'} token），已立即执行首次保温`;
 }
 
 export async function executeHtoff(sessionId, statePath) {
   const state = readState(statePath);
-  const key = state.sessions[sessionId]?.key || (await resolveSessionKey(sessionId, statePath));
+  const key = state.sessions[sessionId]?.key || resolveSessionKey(sessionId);
 
-  updateSessionState(statePath, sessionId, {
-    key,
-    on: false,
-  });
+  updateSessionState(statePath, sessionId, { key, on: false, waiting: false });
 
   try {
     await sidecarControlOff(key);
@@ -116,37 +139,39 @@ export async function executeHtoff(sessionId, statePath) {
   return '💓 心跳已关闭';
 }
 
-export async function executeHto(arg, sessionId, statePath) {
+export async function executeHto(arg, sessionId, statePath, opts = {}) {
   const parsed = parseHtoParam(arg);
   if (!parsed.valid) {
     return parsed.error;
   }
 
   const intervalMin = parsed.minutes;
-  const key = await resolveSessionKey(sessionId, statePath);
+  const key = resolveSessionKey(sessionId);
 
-  const res = await sidecarControlOn(key, intervalMin).catch(() => null);
-
-  let receipt;
-  if (res && res.status === 409) {
-    const rotated = await rotateStaleKey(sessionId, statePath, key, intervalMin);
-    if (rotated) {
-      receipt = `💓 心跳间隔已设为 ${intervalMin}min 并开启，已立即执行首次保温`;
-    } else {
-      updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: true });
-      receipt = `💓 心跳间隔已设为 ${intervalMin}min：sidecar 暂无本会话请求记录，下一次真实请求到达后自动开始保温`;
-    }
-  } else {
-    updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: false });
-    if (!res || res.status !== 200) {
-      receipt = `⚠️ sidecar 未响应（已记录开启意图，reconciler 每分钟自动补挂，间隔 ${intervalMin}min）`;
-    } else {
-      receipt = `💓 心跳间隔已设为 ${intervalMin}min 并开启，已立即执行首次保温`;
-    }
+  const expected = await resolveExpectedPromptTokens(sessionId, key, opts.expectedPromptTokens);
+  const check = await verifyBinding(sessionId, key, { expectedPromptTokens: expected });
+  if (!check.ok) {
+    updateSessionState(statePath, sessionId, { key, on: false, waiting: false });
+    return check.text;
   }
 
-  if (intervalMin >= 60) {
-    receipt += '\n⚠️ 间隔≥60min：1h TTL 缓存会在 ping 间过期';
+  const res = await sidecarControlOn(key, intervalMin).catch(() => null);
+  updateSessionState(statePath, sessionId, {
+    key,
+    on: true,
+    intervalMin,
+    waiting: res != null && res.status === 409,
+  });
+
+  let receipt;
+  if (!res || res.status !== 200) {
+    receipt = `⚠️ sidecar 未响应（已记录开启意图，reconciler 定期自动补挂，间隔 ${intervalMin}min）`;
+  } else {
+    receipt = `💓 心跳间隔已设为 ${intervalMin}min 并开启（前缀 ${check.result?.actualPromptTokens ?? '?'} token），已立即执行首次保温`;
+  }
+
+  if (intervalMin >= 40) {
+    receipt += '\n⚠️ 间隔≥40min：实测缓存存活约 28–45min，可能来不及续期';
   }
   return receipt;
 }

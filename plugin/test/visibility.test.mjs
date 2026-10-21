@@ -6,7 +6,7 @@ import os from 'node:os';
 import http from 'node:http';
 import { apply } from '../lib/index.mjs';
 import { updateSessionState } from '../lib/state.mjs';
-import { getActiveSessionIds } from '../lib/reconciler.mjs';
+import { getActiveSessionIds, runReconciliation } from '../lib/reconciler.mjs';
 
 async function startFakeSidecar(t) {
   const server = http.createServer((req, res) => {
@@ -176,6 +176,10 @@ test('Visibility ③: 取消归档后再次查询重现（模拟 archivedSession
     };
 
     apply(mockCtx);
+
+    // v2：reconciler 周期改为 10min，首轮是 fire-and-forget 的异步任务，
+    // 断言需要确定性 —— 显式跑一次对账，让「归档会话的 state 条目被清理」先落地。
+    await runReconciliation({ ctx: mockCtx, statePath: tmpStateFile });
 
     // 第一次轮询：sess-dynamic 处于归档状态，不应出现
     const res1 = createMockRes();
