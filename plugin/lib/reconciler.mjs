@@ -59,6 +59,7 @@ export function getArchivedIds(ctx) {
 export async function getAllSessionIds(ctx) {
   const allIds = new Set();
   let gotFromCtx = false;
+  let lastError = null;
 
   try {
     if (ctx?.sessionQuery && typeof ctx.sessionQuery.listSessions === 'function') {
@@ -93,7 +94,9 @@ export async function getAllSessionIds(ctx) {
         gotFromCtx = true;
       }
     }
-  } catch {}
+  } catch (e) {
+    lastError = e;
+  }
 
   if (gotFromCtx) return allIds;
 
@@ -110,9 +113,58 @@ export async function getAllSessionIds(ctx) {
         }
       }
     }
-  } catch {}
+  } catch (e) {
+    lastError = lastError || e;
+  }
 
   return allIds;
+}
+
+/**
+ * 权威会话列表快照（2026-10-22 审计修复，codex DEBUG-PLAN §4）。
+ *
+ * 旧行为：listSessions 抛错 -> 磁盘兜底 -> 磁盘也不可用时返回**空 Set** ->
+ * reconciler 认定"全部会话已不存在" -> 把所有 enabled 会话 OFF 并从 state 删除。
+ * 宿主一次短暂抖动就能清空用户配置，这是审计复现过的真实缺陷。
+ *
+ * 新契约：返回 { status, ids, error }：
+ *   · status='ok'          —— 来自权威来源（宿主 API），**只有此时**才允许清理
+ *   · status='disk'        —— 宿主不可用，退回磁盘快照（可作补挂参考，但**不得删除**）
+ *   · status='unavailable' —— 两个来源都失败，本轮必须完全跳过清理
+ */
+export async function getAuthoritativeSessionIds(ctx) {
+  try {
+    if (ctx?.sessionQuery && typeof ctx.sessionQuery.listSessions === 'function') {
+      const records = await ctx.sessionQuery.listSessions();
+      if (Array.isArray(records)) {
+        const ids = new Set();
+        const parsed = [];
+        for (const r of records) {
+          const info = extractSessionInfo(r);
+          if (info) parsed.push(info);
+        }
+        const rootActiveIds = new Set();
+        for (const info of parsed) {
+          if (info.origin !== 'subagent') rootActiveIds.add(info.id);
+        }
+        const archivedNow = getArchivedIds(ctx);
+        for (const id of [...rootActiveIds]) if (archivedNow.has(id)) rootActiveIds.delete(id);
+        for (const info of parsed) {
+          if (info.origin === 'subagent') {
+            if (!info.parentId || !rootActiveIds.has(info.parentId)) continue;
+          }
+          ids.add(info.id);
+        }
+        return { status: 'ok', ids, error: null };
+      }
+    }
+  } catch (e) {
+    // 宿主不可用：继续尝试磁盘，但把状态降级
+  }
+
+  const diskIds = await getAllSessionIds({});
+  if (diskIds.size > 0) return { status: 'disk', ids: diskIds, error: null };
+  return { status: 'unavailable', ids: new Set(), error: 'session-list-unavailable' };
 }
 
 export async function getActiveSessionIds(ctx) {
@@ -125,20 +177,34 @@ export async function getActiveSessionIds(ctx) {
   return active;
 }
 
-export async function runReconciliation({ ctx, statePath, activeSessionIds }) {
+export async function runReconciliation({ ctx, statePath, activeSessionIds, activeStatus }) {
   const state = readState(statePath);
-  const activeSet = activeSessionIds instanceof Set
-    ? activeSessionIds
-    : Array.isArray(activeSessionIds)
-      ? new Set(activeSessionIds)
-      : await getActiveSessionIds(ctx);
+  let activeSet;
+  let cleanupAllowed;
+
+  if (activeSessionIds instanceof Set || Array.isArray(activeSessionIds)) {
+    // 调用方显式给了集合：沿用旧契约（测试与内部调用），默认视为权威
+    activeSet = activeSessionIds instanceof Set ? activeSessionIds : new Set(activeSessionIds);
+    cleanupAllowed = activeStatus ? activeStatus === 'ok' : true;
+  } else {
+    // 生产路径：用带状态的权威快照（2026-10-22 审计修复 §4）
+    const snap = await getAuthoritativeSessionIds(ctx);
+    activeSet = snap.ids;
+    // **只有权威成功快照才允许清理**。宿主抖动 / 磁盘也不可用时，
+    // 绝不因为"看不到"就判定"已删除"。
+    cleanupAllowed = snap.status === 'ok';
+    if (!cleanupAllowed) {
+      console.log(`[reconciler] session list status=${snap.status}; skipping removals this round`);
+    }
+  }
 
   const sessionEntries = Object.entries(state.sessions || {});
-  const reconciled = { removed: [], reconnected: [], rekeyed: [] };
+  const reconciled = { removed: [], reconnected: [], rekeyed: [], skippedCleanup: !cleanupAllowed };
 
   for (const [sessionId, session] of sessionEntries) {
     // 若已不存在或处于 deleted/archived 状态
     if (!activeSet.has(sessionId)) {
+      if (!cleanupAllowed) continue;   // 快照不可信：保留配置，下轮再判
       if (session.on && session.key) {
         try {
           await sidecarControlOff(session.key);

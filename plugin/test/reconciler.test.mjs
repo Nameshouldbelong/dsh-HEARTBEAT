@@ -182,3 +182,65 @@ test('v2 会话动态加载: archived 实时过滤 + 全量列表与归档集合
   const active3 = await getActiveSessionIds(ctx);
   assert.deepEqual([...active3].sort(), ['sess-b', 'sess-c'], '新归档应立刻生效');
 });
+
+// ── 2026-10-22 codex 审计（DEBUG-PLAN §4）回归 ─────────────────────────────
+
+test('审计§4: 宿主会话查询失败且磁盘不可用 -> 绝不清理已开启会话', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const pathm = await import('node:path');
+  const dir = fs.mkdtempSync(pathm.join(os.tmpdir(), 'hb-audit4-'));
+  const statePath = pathm.join(dir, 'state.json');
+  fs.writeFileSync(statePath, JSON.stringify({
+    version: 1,
+    sessions: { 'session-A': { key: 'dshsc-aaaaaaaaaaaaaaaa', on: true, intervalMin: 30 } },
+  }));
+
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = pathm.join(dir, 'nonexistent-host-home');  // 模拟磁盘兜底也不可用
+  try {
+    const result = await runReconciliation({
+      ctx: {
+        sessionQuery: { listSessions: async () => { throw new Error('host temporarily unavailable'); } },
+        workspaceRegistry: { archivedSessionIds: [] },
+      },
+      statePath,
+    });
+
+    assert.deepEqual(result.removed, [], '宿主抖动时不得删除任何会话');
+    assert.equal(result.skippedCleanup, true, '应标记本轮跳过清理');
+    const after = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.ok(after.sessions['session-A'], '已开启会话的配置必须保留');
+    assert.equal(after.sessions['session-A'].on, true, 'on 状态必须保留');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('审计§4: 权威列表成功且会话确实不存在 -> 仍然正常清理', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const pathm = await import('node:path');
+  const dir = fs.mkdtempSync(pathm.join(os.tmpdir(), 'hb-audit4b-'));
+  const statePath = pathm.join(dir, 'state.json');
+  fs.writeFileSync(statePath, JSON.stringify({
+    version: 1,
+    sessions: { 'session-gone': { key: 'dshsc-bbbbbbbbbbbbbbbb', on: false, intervalMin: 30 } },
+  }));
+  try {
+    const result = await runReconciliation({
+      ctx: {
+        sessionQuery: { listSessions: async () => [/* 确实没有 session-gone */{ header: { id: 'session-other' } }] },
+        workspaceRegistry: { archivedSessionIds: [] },
+      },
+      statePath,
+    });
+    assert.deepEqual(result.removed, ['session-gone'], '权威列表确认不存在时应清理');
+    assert.equal(result.skippedCleanup, false);
+    const after = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(after.sessions['session-gone'], undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

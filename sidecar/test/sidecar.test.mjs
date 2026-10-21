@@ -1429,3 +1429,95 @@ test('2026-10-21 自检: 陈旧流量（>45min 无真实请求）报警', async 
     if (sidecar.pingTimers.has(key)) { clearInterval(sidecar.pingTimers.get(key)); sidecar.pingTimers.delete(key); }
   }
 });
+
+// ── 2026-10-22 codex 审计（DEBUG-PLAN §3/§5）回归 ──────────────────────────
+
+test('审计§3: Chat Completions 的 cache_write_tokens 归一化为 creation（纯写缓存不再判 no-cache）', () => {
+  const u = sidecar.extractUsage(JSON.stringify({
+    usage: { prompt_tokens: 100000, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 100000 } },
+  }));
+  assert.equal(u.cache_creation_input_tokens, 100000, 'cache_write_tokens 必须映射到 creation');
+  assert.equal(sidecar.classifyPingResult(200, u), 'recreated', '纯写缓存是 recreated，不是 no-cache');
+
+  // 嵌套变体也要认
+  const v = sidecar.extractUsage(JSON.stringify({
+    usage: { prompt_tokens: 5000, prompt_tokens_details: { cache_creation_tokens: 4800 } },
+  }));
+  assert.equal(v.cache_creation_input_tokens, 4800);
+});
+
+test('审计§3: 命中率分母含缓存读写（Anthropic 真实 0.1% 命中不得判 hit）', () => {
+  // Anthropic 语义：input_tokens 只含未命中部分
+  const low = { input_tokens: 100, cache_read_input_tokens: 1000, cache_creation_input_tokens: 999000 };
+  assert.equal(sidecar.totalInputTokens(low), 1000100, 'totalInput = input + read + creation');
+  assert.equal(sidecar.classifyPingResult(200, low), 'recreated',
+    '真实命中率 0.1%，必须判为失败（recreated），绝不能 hit');
+
+  // 真实全命中仍要判 hit
+  const high = { input_tokens: 100, cache_read_input_tokens: 999900, cache_creation_input_tokens: 0 };
+  assert.equal(sidecar.classifyPingResult(200, high), 'hit');
+
+  // OpenAI 语义：prompt_tokens 已含 cached，不能重复相加
+  const oa = { prompt_tokens: 100000, cache_read_input_tokens: 99900 };
+  assert.equal(sidecar.totalInputTokens(oa), 100000, 'OpenAI 语义下分母就是 prompt_tokens');
+  assert.equal(sidecar.classifyPingResult(200, oa), 'hit');
+});
+
+test('审计§5: 同 key 不会有两个并发 ping（单在途锁）', async (t) => {
+  const http = await import('node:http');
+  let active = 0, peak = 0;
+  const held = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      active++; peak = Math.max(peak, active);
+      const finish = () => {
+        active--;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ usage: { prompt_tokens: 100, cached_tokens: 100 } }));
+      };
+      held.push(finish);   // 挂住，模拟慢上游
+    });
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  Object.assign(process.env, {
+    UPSTREAM_HOST: '127.0.0.1', UPSTREAM_PORT: String(upstream.address().port),
+    UPSTREAM_PROTOCOL: 'http', UPSTREAM_PREFIX: '',
+  });
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const saved = { ...sidecar.config };
+  sidecar.config.recencyWindowMs = 0;
+  t.after(() => {
+    for (const f of held.splice(0)) f();
+    Object.assign(sidecar.config, saved);
+    upstream.close(); sidecar.server.close();
+  });
+
+  const key = 'dshsc-locklocklocklock';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: 0,
+  });
+  sidecar.pings.set(key, { key, on: true, stale: false, intervalMin: 30, pingCount: 0 });
+
+  // 连续 5 次触发（模拟 主周期 + retry + 顺延 + 立即 + 真实流量复活 同时发生）
+  sidecar.runPing(key);
+  sidecar.runPing(key);
+  sidecar.runPing(key);
+  sidecar.runPing(key);
+  sidecar.runPing(key);
+  await new Promise((r) => setTimeout(r, 300));
+
+  assert.equal(peak, 1, '同一 key 任何时刻只允许 1 个在途上游请求，实测峰值 ' + peak);
+  assert.equal(sidecar.pings.get(key).inFlight, true, '应处于在途状态');
+  assert.equal(sidecar.pings.get(key).pendingPing, true, '后续触发应被记为 pending');
+
+  // 放行后锁应释放，且 pending 会补一次（不并发）
+  for (const f of held.splice(0)) f();
+  await new Promise((r) => setTimeout(r, 2500));
+  assert.equal(sidecar.pings.get(key).inFlight === true && sidecar.pings.get(key).pendingPing === true, false,
+    '锁必须释放，pending 必须被消费');
+
+  sidecar.pings.delete(key);
+  sidecar.recordedRequests.delete(key);
+});

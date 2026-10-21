@@ -186,11 +186,21 @@ function extractUsage(txt) {
   // 2026-10-19 起 kimi-coding 协议切到 openai-completions：缓存读取语义在
   // prompt_tokens_details.cached_tokens（anthropic 形态是 cache_read_input_tokens）。
   // 统一归一化到 anthropic 字段名，分类/UI/统计层无需感知协议差异。
-  const cached = Number(
-    (merged.prompt_tokens_details && merged.prompt_tokens_details.cached_tokens) ??
-    merged.cached_tokens ?? 0);
+  const details = merged.prompt_tokens_details || {};
+  const cached = Number(details.cached_tokens ?? merged.cached_tokens ?? 0);
   if (cached > 0 && merged.cache_read_input_tokens == null) {
     merged.cache_read_input_tokens = cached;
+  }
+  // 2026-10-22 审计修复（codex DEBUG-PLAN §3）：Chat Completions 的**缓存写入**字段
+  // 未归一化 → 纯写缓存的一次 ping 会被判成 no-cache 并计入失败，
+  // 进而触发命中墙误关。OpenAI 系端点写缓存时 cached_tokens=0 而写字段>0。
+  const writeTokens = Number(
+    details.cache_write_tokens ??
+    details.cache_creation_tokens ??
+    merged.cache_write_input_tokens ??
+    0);
+  if (writeTokens > 0 && merged.cache_creation_input_tokens == null) {
+    merged.cache_creation_input_tokens = writeTokens;
   }
   return merged;
 }
@@ -577,20 +587,61 @@ function buildPingBody(recordedBuffer) {
 
 // ping 结果三分类：cache 命中 / cache 重建 / 无缓存(2xx 但读写皆 0) / 传输或 API 错误
 // HTTP/API 错误(429/5xx/timeout/ECONNRESET)绝不计入 cache 失败——两者分开统计
+/**
+ * 归一化"总输入 token"（2026-10-22 审计修复，codex DEBUG-PLAN §3）。
+ *
+ * 两种协议的语义不同，这是命中率算错分母的根源：
+ *   · Anthropic：`input_tokens` **只含未命中部分**，缓存读写各在独立字段，
+ *     故 totalInput = input_tokens + cache_read + cache_creation。
+ *   · OpenAI/Chat Completions：`prompt_tokens` **已含**命中部分
+ *     （cached_tokens 是它的子集），故 totalInput = prompt_tokens。
+ * 用错语义会把真实命中率 0.1% 算成 99%（审计已复现该误判）。
+ *
+ * 判定依据：只要出现 Anthropic 专属字段（input_tokens 且无 prompt_tokens），
+ * 或显式给了 cache_creation_input_tokens 而 prompt_tokens 缺失，就走 Anthropic 语义。
+ */
+function totalInputTokens(usage) {
+  if (!usage) return 0;
+  const read = Number(usage.cache_read_input_tokens || usage.cached_tokens || 0);
+  const creation = Number(usage.cache_creation_input_tokens || usage.cache_creation_tokens || 0);
+  const prompt = Number(usage.prompt_tokens || 0);
+  const input = Number(usage.input_tokens || 0);
+
+  // 有 prompt_tokens 且没有独立 input_tokens -> OpenAI 语义（prompt 已含缓存）
+  if (prompt > 0 && input === 0) return prompt;
+
+  // Anthropic 语义：三者相加
+  if (input > 0 || read > 0 || creation > 0) return input + read + creation;
+
+  return 0;
+}
+
 function classifyPingResult(statusCode, usage, hitRatioMin) {
   if (statusCode >= 200 && statusCode < 300) {
+    const totalInput = totalInputTokens(usage);
     const read = Number((usage && usage.cache_read_input_tokens) || 0);
     const creation = Number((usage && (usage.cache_creation_input_tokens || usage.cache_creation_tokens)) || 0);
-    // 命中率门槛（2026-10-20）：cached 很少（如 12800/291557 = 4.4%）时，
-    // 绝大部分前缀仍按全价重算，不能算 hit。prompt 规模未知时退化为旧的 read>0。
-    const promptTokens = Number(
-      (usage && (usage.prompt_tokens || usage.input_tokens)) || 0);
     const min = typeof hitRatioMin === 'number' ? hitRatioMin : config.hitRatioMin;
-    if (read > 0) {
-      if (promptTokens > 0 && read / promptTokens < min) return 'no-cache';
+    // 命中率门槛（2026-10-20）：cached 很少（如 12800/291557 = 4.4%）时，
+    // 绝大部分前缀仍按全价重算，不能算 hit。
+    //
+    // 2026-10-22 审计修复（codex DEBUG-PLAN §3）：**分母必须是 totalInput，
+    // 即 read + creation + uncached**，不能只取 prompt_tokens。
+    // Anthropic 语义下 input_tokens 只含未命中部分（不含缓存读写），
+    // 用它当分母会让真实命中率 0.1% 的情形算成 99% 而误判 HIT —— 这正是
+    // "低命中却显示健康"的另一条路径。prompt 规模完全未知时才退化为 read>0。
+    if (totalInput > 0) {
+      const ratio = read / totalInput;
+      if (ratio < min) {
+        // 有写入且读很少 = 本轮回建（recreated），比 no-cache 更精确；
+        // 但两者都属于"没保住"，调用方都按失败计数处理。
+        return creation > 0 ? 'recreated' : 'no-cache';
+      }
       return 'hit';
     }
+    if (read > 0) return 'hit';
     if (creation > 0) return 'recreated';
+    // 完全没有 usage（某些代理会吞掉）→ 不能断言"没命中"，交上层按未知处理
     return 'no-cache';
   }
   return 'error';
@@ -622,11 +673,40 @@ function scheduleRetry(key) {
   console.log(`[ping] key=${key} transport/API failure, retry #${retry} in ${Math.round(delayMs / 1000)}s`);
 }
 
+/**
+ * 释放 in-flight 锁并处理"在途期间又有人想 ping"的情况（2026-10-22 §5）。
+ * 必须有单一路径，否则漏一个 return 就会把该 key 永久锁死。
+ */
+function releaseInFlight(key) {
+  const st = pings.get(key);
+  if (!st) return;
+  st.inFlight = false;
+  const wantMore = st.pendingPing === true;
+  st.pendingPing = false;
+  if (wantMore && st.on && !st.stale) {
+    // 在途期间被请求过：等一拍再补一次，避免与刚结束的请求贴太近
+    const t = setTimeout(() => runPing(key), 2000);
+    if (t.unref) t.unref();
+    st.deferTimer = t;
+  }
+}
+
 function runPing(key) {
   const pingState = pings.get(key);
   if (!pingState || !pingState.on || pingState.stale) return;
   const rec = recordedRequests.get(key);
   if (!rec) return;
+
+  // 单在途锁（2026-10-22 审计修复，codex DEBUG-PLAN §5）。
+  // 旧实现下"主周期 + 快速 retry + 顺延 + 立即 ping"四条触发路径可各自
+  // 发起上游请求：审计复现了同 key 峰值 2 个并发 ping。那不只是浪费——
+  // 并发重放会让后到的响应覆盖先到的状态、互相清 retry 计数，
+  // 并放大冷读风险（一个大前缀会话同时两个全价请求）。
+  if (pingState.inFlight) {
+    // 已有在途：只记录"又有人想 ping"，等本轮结束后按需补一次，绝不并发
+    pingState.pendingPing = true;
+    return;
+  }
 
   // 并发保护：该 key 的真实请求 lastSeen <10s 时本次重放顺延 30s
   // (immediate ping / retry / 周期 ping 一律遵守)
@@ -634,8 +714,11 @@ function runPing(key) {
   if (now - rec.lastSeenMs < config.recencyWindowMs) {
     const delayTimer = setTimeout(() => runPing(key), config.recencyDeferMs);
     if (delayTimer.unref) delayTimer.unref();
+    // 保存句柄，使 OFF 能真正取消它（旧实现泄漏 timer）
+    pingState.deferTimer = delayTimer;
     return;
   }
+  pingState.inFlight = true;
 
   let pingBody;
   try {
@@ -649,6 +732,7 @@ function runPing(key) {
     }
     pingBody = Buffer.from(JSON.stringify(pj), 'utf8');
   } catch (e) {
+    releaseInFlight(key);
     return;
   }
 
@@ -682,6 +766,8 @@ function runPing(key) {
       if (pingTimers.has(key)) { clearInterval(pingTimers.get(key)); pingTimers.delete(key); }
       if (pingState.retryTimer) { clearTimeout(pingState.retryTimer); pingState.retryTimer = null; }
       console.log(`[ping] key=${key} AUTO-OFF: fatal auth/quota error ${errStr}`);
+      persistPings();
+      releaseInFlight(key);
       return;
     }
     log({
@@ -718,6 +804,7 @@ function runPing(key) {
         if (result === 'error') {
           // HTTP 429/5xx 等：transport/API 临时错误 -> retry，不算 cache miss
           onTransportFailure(upRes.statusCode, 'http-' + upRes.statusCode);
+          releaseInFlight(key);
           return;
         }
         log({
@@ -774,6 +861,7 @@ function runPing(key) {
         } else {
           pingState.consecutiveZeroCacheRead = 0;
         }
+        releaseInFlight(key);
       });
     }
   );
@@ -784,6 +872,7 @@ function runPing(key) {
 
   upReq.on('error', (e) => {
     onTransportFailure(502, String(e && e.message ? e.message : e));
+    releaseInFlight(key);
   });
 
   upReq.end(pingBody);
@@ -1094,6 +1183,12 @@ const server = http.createServer((req, res) => {
           clearTimeout(p.retryTimer);
           p.retryTimer = null;
         }
+        // 审计 §5：顺延 timer 旧实现没有句柄、OFF 无法取消，会留下野回调
+        if (p.deferTimer) {
+          clearTimeout(p.deferTimer);
+          p.deferTimer = null;
+        }
+        p.pendingPing = false;
         // KI-2：关闭保温即删除其持久化请求体（不留存不必要的隐私数据）
         persistDeleteKey(key);
         persistPings();
@@ -1295,6 +1390,7 @@ module.exports = {
   loadPersistedPings,
   persistDeleteKey,
   runSelfCheck,
+  totalInputTokens,
   PERSIST_FILE,
   PINGS_FILE,
 };
