@@ -129,15 +129,19 @@ test('B5: buildPingBody 固定 max_tokens=16（2026-10-15 实测：max_tokens=1 
   assert.equal(none.max_tokens, 16);
 });
 
-test('P0-4: classifyPingResult 三分类（hit / recreated / no-cache / error）', () => {
-  // T3: cache hit 判 healthy
+test('P0-4: classifyPingResult 五分类（hit / recreated / no-cache / unknown / error）', () => {
+  // T3: cache hit 判 healthy（需要分母才谈命中率；这里给足 read）
   assert.equal(sidecar.classifyPingResult(200, { cache_read_input_tokens: 100000, cache_creation_input_tokens: 0 }), 'hit');
-  // T4: cache 重建（read=0 但 creation>0）判 healthy
+  // T4: cache 重建（read 少但 creation>0）——**仍属"没保住"**，
+  // 2026-10-22 第二轮审计后与 no-cache 同归失败计数（返回值仍区分，便于遥测）
   assert.equal(sidecar.classifyPingResult(200, { cache_read_input_tokens: 0, cache_creation_input_tokens: 100000 }), 'recreated');
   assert.equal(sidecar.classifyPingResult(200, { cache_creation_tokens: 5000 }), 'recreated'); // 兼容字段名
   // 2xx 但读写皆 0
-  assert.equal(sidecar.classifyPingResult(200, { cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }), 'no-cache');
-  assert.equal(sidecar.classifyPingResult(200, {}), 'no-cache');
+  // 读写皆 0 且**有分母**（prompt_tokens）才是确认的 no-cache；
+  // 连分母都没有时属"无法判断" -> unknown（见下一条）
+  assert.equal(sidecar.classifyPingResult(200, { prompt_tokens: 1000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }), 'no-cache');
+  // 完全没有 usage -> unknown（不能断言"确认未命中"，2026-10-22 审计问题 3b）
+  assert.equal(sidecar.classifyPingResult(200, {}), 'unknown');
   // T5: HTTP 429/5xx 是 transport/API 错误，不是 cache miss
   assert.equal(sidecar.classifyPingResult(429, {}), 'error');
   assert.equal(sidecar.classifyPingResult(500, { cache_read_input_tokens: 0 }), 'error');
@@ -1509,15 +1513,170 @@ test('审计§5: 同 key 不会有两个并发 ping（单在途锁）', async (t
   await new Promise((r) => setTimeout(r, 300));
 
   assert.equal(peak, 1, '同一 key 任何时刻只允许 1 个在途上游请求，实测峰值 ' + peak);
-  assert.equal(sidecar.pings.get(key).inFlight, true, '应处于在途状态');
-  assert.equal(sidecar.pings.get(key).pendingPing, true, '后续触发应被记为 pending');
+  assert.equal(sidecar.inFlightKeys.has(key), true, '应处于在途状态（全局锁）');
+  assert.equal(sidecar.pendingPingKeys.has(key), true, '后续触发应被记为 pending');
 
-  // 放行后锁应释放，且 pending 会补一次（不并发）
+  // 放行后：锁释放 -> pending 补一次（仍不并发）。补发会在 2s 后再占锁，
+  // 因此不能断言"某一刻锁为空"，而要断言**峰值始终为 1**（真正的约束）。
+  for (const f of held.splice(0)) f();
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.ok(peak === 1, '补发阶段也不得出现并发，实测峰值 ' + peak);
+  assert.equal(sidecar.pendingPingKeys.has(key), false, 'pending 必须被消费（不重复补发）');
+
+  // 稳定后再确认最终无并发、锁最终会释放
   for (const f of held.splice(0)) f();
   await new Promise((r) => setTimeout(r, 2500));
-  assert.equal(sidecar.pings.get(key).inFlight === true && sidecar.pings.get(key).pendingPing === true, false,
-    '锁必须释放，pending 必须被消费');
+  assert.ok(peak === 1, '全程峰值必须为 1，实测 ' + peak);
 
   sidecar.pings.delete(key);
   sidecar.recordedRequests.delete(key);
+});
+
+test('审计二-3: recreated（有缓存写入但低命中）必须计入失败，与 no-cache 同等对待', async (t) => {
+  const http = await import('node:http');
+  const ups = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      // 关键：**有** cache_creation（100000）但 read=0 → recreated
+      res.end(JSON.stringify({ usage: { prompt_tokens: 100000, cached_tokens: 0, cache_creation_tokens: 100000 } }));
+    });
+  });
+  await new Promise((r) => ups.listen(0, '127.0.0.1', r));
+  Object.assign(process.env, { UPSTREAM_HOST: '127.0.0.1', UPSTREAM_PORT: String(ups.address().port), UPSTREAM_PROTOCOL: 'http', UPSTREAM_PREFIX: '' });
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const saved = { ...sidecar.config };
+  sidecar.config.recencyWindowMs = 0;
+  sidecar.config.failThreshold = 1;
+  t.after(() => { Object.assign(sidecar.config, saved); ups.close(); sidecar.server.close(); });
+
+  const key = 'dshsc-recreatedfail01';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: 0,
+  });
+  sidecar.pings.set(key, { key, on: true, stale: false, intervalMin: 30, pingCount: 0, consecutiveZeroCacheRead: 0 });
+
+  sidecar.runPing(key);
+  const t0 = Date.now();
+  let p = null;
+  while (Date.now() - t0 < 3000) {
+    p = sidecar.pings.get(key);
+    if (p && p.pingCount >= 1) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(p && p.pingCount >= 1, '应完成一次 ping');
+  // 分类为 recreated 后因达 failThreshold 立即自动关停，health 会被写成 'stale'。
+  // 因此断言"关停 + 计数已累加"，而不是仍保留 recreated 标签。
+  assert.equal(p.on, false,
+    '❗recreated（有写入但没保住）必须触发命中墙自动关停，不能清零计数继续烧钱');
+  assert.ok((p.consecutiveZeroCacheRead || 0) >= 1, '失败计数必须累加（旧实现会清零）');
+  assert.equal(p.stale, true, '应置 stale 表示已熔断');
+
+  sidecar.pings.delete(key);
+  sidecar.recordedRequests.delete(key);
+  sidecar.inFlightKeys.delete(key);
+  sidecar.pendingPingKeys.delete(key);
+});
+
+test('审计二-3: 完全缺失 usage 判 unknown —— 既不计失败也不清零', async (t) => {
+  const http = await import('node:http');
+  const ups = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'x', choices: [] }));   // 无 usage
+    });
+  });
+  await new Promise((r) => ups.listen(0, '127.0.0.1', r));
+  Object.assign(process.env, { UPSTREAM_HOST: '127.0.0.1', UPSTREAM_PORT: String(ups.address().port), UPSTREAM_PROTOCOL: 'http', UPSTREAM_PREFIX: '' });
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const saved = { ...sidecar.config };
+  sidecar.config.recencyWindowMs = 0;
+  sidecar.config.failThreshold = 1;
+  t.after(() => { Object.assign(sidecar.config, saved); ups.close(); sidecar.server.close(); });
+
+  const key = 'dshsc-unknownusage1';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: 0,
+  });
+  // 预置一次失败计数，验证 unknown 不会把它清零
+  sidecar.pings.set(key, { key, on: true, stale: false, intervalMin: 30, pingCount: 0, consecutiveZeroCacheRead: 1 });
+
+  sidecar.runPing(key);
+  const t0 = Date.now();
+  let p = null;
+  while (Date.now() - t0 < 3000) {
+    p = sidecar.pings.get(key);
+    if (p && p.pingCount >= 1) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(p && p.pingCount >= 1, '应完成一次 ping');
+  assert.equal(p.health, 'unknown', '无 usage 必须标为未知');
+  assert.equal(p.consecutiveZeroCacheRead, 1,
+    '❗unknown 不得清零既有失败计数（否则"无法判断"被当成成功）');
+  assert.equal(p.on, true, 'unknown 不应触发自动关停（无证据）');
+
+  sidecar.pings.delete(key);
+  sidecar.recordedRequests.delete(key);
+  sidecar.inFlightKeys.delete(key);
+  sidecar.pendingPingKeys.delete(key);
+});
+
+test('审计二-5: 请求在途时重新 /control/on —— 全局锁必须仍然有效', async (t) => {
+  const http = await import('node:http');
+  let active = 0, peak = 0;
+  const held = [];
+  const ups = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      active++; peak = Math.max(peak, active);
+      held.push(() => {
+        active--;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ usage: { prompt_tokens: 100, cached_tokens: 100 } }));
+      });
+    });
+  });
+  await new Promise((r) => ups.listen(0, '127.0.0.1', r));
+  Object.assign(process.env, { UPSTREAM_HOST: '127.0.0.1', UPSTREAM_PORT: String(ups.address().port), UPSTREAM_PROTOCOL: 'http', UPSTREAM_PREFIX: '' });
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const saved = { ...sidecar.config }; sidecar.config.recencyWindowMs = 0;
+  t.after(() => { for (const f of held.splice(0)) f(); Object.assign(sidecar.config, saved); ups.close(); sidecar.server.close(); });
+
+  const port = sidecar.server.address().port;
+  const post = (p, o) => new Promise((resolve) => {
+    const r = http.request({ hostname: '127.0.0.1', port, path: p, method: 'POST', headers: { 'content-type': 'application/json' } },
+      (res) => { const cs = []; res.on('data', (c) => cs.push(c)); res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(cs).toString())); } catch { resolve({}); } }); });
+    r.write(JSON.stringify(o)); r.end();
+  });
+
+  const key = 'dshsc-reonrace000001';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: 0,
+  });
+
+  // 1) 开启并让一次 ping 挂在上游
+  await post('/control/on', { key, intervalMin: 30 });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(sidecar.inFlightKeys.has(key), true, '首个 ping 应在途');
+
+  // 2) **在途期间重新开启**（旧实现会替换 pings 对象，锁藏在对象里就丢了）
+  await post('/control/on', { key, intervalMin: 25 });
+  // 3) 再触发一次
+  sidecar.runPing(key);
+  await new Promise((r) => setTimeout(r, 300));
+
+  assert.equal(peak, 1, '❗重开后旧请求仍在途，不得产生第二个并发上游请求，实测峰值 ' + peak);
+  assert.equal(sidecar.pings.get(key).intervalMin, 25, '新间隔应生效');
+
+  // 清理
+  for (const f of held.splice(0)) f();
+  await new Promise((r) => setTimeout(r, 300));
+  await post('/control/off', { key });
+  sidecar.recordedRequests.delete(key);
+  sidecar.inFlightKeys.delete(key);
+  sidecar.pendingPingKeys.delete(key);
 });

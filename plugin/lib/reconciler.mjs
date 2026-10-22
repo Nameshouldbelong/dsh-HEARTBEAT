@@ -262,10 +262,38 @@ export async function runReconciliation({ ctx, statePath, activeSessionIds, acti
         }
         const res = await sidecarControlOn(derivedKey, session.intervalMin || 30);
         const waiting = res != null && res.status === 409;
-        // 交叉校验通过后要把遗留的 verifyError 清掉（否则 UI 会一直显示旧失败原因）
+
+        // 2026-10-22 第二轮审计修复（问题 1）：**必须核对 sidecar 的真实状态**。
+        // 旧逻辑只看 HTTP 200 就当"已挂上"，但 sidecar 若已因低命中/401 熔断
+        // （pings.on=false, stale=true），/control/on 仍会返回 200 而**不清除熔断**。
+        // 于是插件继续显示 on=true、每轮对账继续调用，熔断被周期性对账绕过。
+        const sidecarState = res && res.data && res.data.state ? res.data.state : null;
+        const refusedByBreaker = sidecarState != null
+          && (sidecarState.on === false || sidecarState.stale === true);
+
+        if (refusedByBreaker) {
+          // 把熔断原因同步到插件侧，并**停止后续补挂**（置 on:false），
+          // 避免下一次对账再次尝试。用户显式 /HTON 才会重新开启。
+          const reason = sidecarState.health === 'stale' || sidecarState.stale
+            ? 'breaker-tripped'
+            : 'sidecar-refused';
+          updateSessionState(statePath, sessionId, {
+            on: false,
+            waiting: false,
+            verifyError: null,
+            blockedReason: reason,
+            blockedAt: Date.now(),
+          });
+          reconciled.blocked = reconciled.blocked || [];
+          reconciled.blocked.push({ sessionId, reason });
+          continue;
+        }
+
+        // 交叉校验通过后要把遗留的 verifyError / 熔断标记清掉
         const patch = {};
         if ((session.waiting === true) !== waiting) patch.waiting = waiting;
         if (session.verifyError) patch.verifyError = null;
+        if (session.blockedReason) { patch.blockedReason = null; patch.blockedAt = null; }
         if (Object.keys(patch).length) updateSessionState(statePath, sessionId, patch);
         reconciled.reconnected.push(sessionId);
       } catch {}
@@ -290,8 +318,11 @@ export function startReconciler({ ctx, statePath, intervalMs = 10 * 60 * 1000, h
       // 全量列表（贵）给快照缓存；活跃集合（含实时归档过滤）供本轮对账
       const allIds = await getAllSessionIds(ctx);
       hooks.onAllSessions?.(allIds);
-      const activeIds = await getActiveSessionIds(ctx);
-      const r = await runReconciliation({ ctx, statePath, activeSessionIds: activeIds });
+      // 2026-10-22 第二轮审计修复（问题 2）：生产路径**不得**先自己取集合再以
+      // activeSessionIds 传入 —— 那会命中"显式集合默认可信"分支，
+      // 宿主列表失败+磁盘为空时用空集合删掉全部配置。
+      // 改为把 ctx 交给 runReconciliation，由它调用带状态的 getAuthoritativeSessionIds()。
+      const r = await runReconciliation({ ctx, statePath });
       hooks.onReconciled?.(r);
     } catch {
     } finally {

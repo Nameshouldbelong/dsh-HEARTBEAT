@@ -212,6 +212,11 @@ const recordedRequests = new Map(); // key -> { body: Buffer, path: string, head
 //          lastUsage, lastError, retryCount, retryTimer, consecutiveZeroCacheRead, consecutiveTransportFailures }
 const pings = new Map();
 const pingTimers = new Map(); // key -> Interval
+// 2026-10-22 第二轮审计加固：在途锁必须独立于 pings 状态对象。
+// /control/on 会整体替换 pings.get(key) 的对象，若锁存在对象里，
+// 旧请求仍在途时新对象看不到锁 → 仍会并发。改为按 key 的独立集合。
+const inFlightKeys = new Set();
+const pendingPingKeys = new Set();
 
 // ── KI-2 修复（2026-10-21）：保温中的请求体落盘 ────────────────────────────
 // 原实现 recordedRequests 纯内存，sidecar 每次重启（部署/崩溃/系统重启）即丢失，
@@ -641,8 +646,10 @@ function classifyPingResult(statusCode, usage, hitRatioMin) {
     }
     if (read > 0) return 'hit';
     if (creation > 0) return 'recreated';
-    // 完全没有 usage（某些代理会吞掉）→ 不能断言"没命中"，交上层按未知处理
-    return 'no-cache';
+    // 2026-10-22 第二轮审计修复（问题 3b）：完全没有 usage 时**不能断言"没命中"**。
+    // 旧实现返回 'no-cache' → 被计入失败并可能自动停机，
+    // 把"无法判断"误当成"确认未命中"。改为 'unknown'，由上层按未知处理。
+    return 'unknown';
   }
   return 'error';
 }
@@ -678,11 +685,11 @@ function scheduleRetry(key) {
  * 必须有单一路径，否则漏一个 return 就会把该 key 永久锁死。
  */
 function releaseInFlight(key) {
+  inFlightKeys.delete(key);
   const st = pings.get(key);
+  const wantMore = pendingPingKeys.has(key);
+  pendingPingKeys.delete(key);
   if (!st) return;
-  st.inFlight = false;
-  const wantMore = st.pendingPing === true;
-  st.pendingPing = false;
   if (wantMore && st.on && !st.stale) {
     // 在途期间被请求过：等一拍再补一次，避免与刚结束的请求贴太近
     const t = setTimeout(() => runPing(key), 2000);
@@ -702,9 +709,10 @@ function runPing(key) {
   // 发起上游请求：审计复现了同 key 峰值 2 个并发 ping。那不只是浪费——
   // 并发重放会让后到的响应覆盖先到的状态、互相清 retry 计数，
   // 并放大冷读风险（一个大前缀会话同时两个全价请求）。
-  if (pingState.inFlight) {
+  if (inFlightKeys.has(key)) {
     // 已有在途：只记录"又有人想 ping"，等本轮结束后按需补一次，绝不并发
-    pingState.pendingPing = true;
+    // 待补标记也存全局，避免随状态对象被替换而丢失
+    pendingPingKeys.add(key);
     return;
   }
 
@@ -718,7 +726,7 @@ function runPing(key) {
     pingState.deferTimer = delayTimer;
     return;
   }
-  pingState.inFlight = true;
+  inFlightKeys.add(key);
 
   let pingBody;
   try {
@@ -824,7 +832,7 @@ function runPing(key) {
         pingState.pingCount = (pingState.pingCount || 0) + 1;
         pingState.lastUsage = usage;
         pingState.lastError = null;
-        pingState.health = result; // 'hit' | 'recreated' | 'no-cache'
+        pingState.health = result; // 'hit' | 'recreated' | 'no-cache' | 'unknown'
         pingState.consecutiveTransportFailures = 0;
         pingState.retryCount = 0;
 
@@ -836,9 +844,11 @@ function runPing(key) {
         persistBodies();
         persistPings();
 
-        if (result === 'no-cache') {
-          // 2xx 但命中率低于门槛（或读写皆 0）：算一次 cache 失败。
-          // 连续 failThreshold 次（默认 2）-> 置 stale 并自动关闭 ping，止损不烧钱。
+        if (result === 'no-cache' || result === 'recreated') {
+          // 2xx 但没保住缓存：**两种都算失败**（2026-10-22 第二轮审计修复，问题 3a）。
+          // 旧实现只对 no-cache 累加、对 recreated 清零 —— 于是"有缓存写入但读数很少"
+          // （典型：前缀变了、全量重建）会被当成成功，绕过命中墙无限烧钱。
+          // 注释一直写"两者都属于没保住"，现在行为与注释一致。
           pingState.consecutiveZeroCacheRead = (pingState.consecutiveZeroCacheRead || 0) + 1;
           // 2026-10-20：单个 50min 间隔周期内只会 ping 一次，靠"连续 N 次"要等 100 分钟，
           // 期间每次都是全价重算 —— 太慢。首次 immediate ping 就低命中即视为失败并关闭
@@ -858,9 +868,11 @@ function runPing(key) {
             console.log(`[ping] key=${key} AUTO-OFF: ${pingState.consecutiveZeroCacheRead} consecutive cache-miss pings (ratio < ${config.hitRatioMin}) — stopped to avoid burning quota`);
             persistPings();
           }
-        } else {
+        } else if (result === 'hit') {
+          // 只有确认命中才清零
           pingState.consecutiveZeroCacheRead = 0;
         }
+        // result === 'unknown'：既不计失败也不清零（无信息量）
         releaseInFlight(key);
       });
     }
@@ -1215,7 +1227,7 @@ const server = http.createServer((req, res) => {
           clearTimeout(p.deferTimer);
           p.deferTimer = null;
         }
-        p.pendingPing = false;
+        pendingPingKeys.delete(key);
         // KI-2：关闭保温即删除其持久化请求体（不留存不必要的隐私数据）
         persistDeleteKey(key);
         persistPings();
@@ -1409,6 +1421,8 @@ module.exports = {
   recordedRequests,
   pings,
   pingTimers,
+  inFlightKeys,
+  pendingPingKeys,
   config,
   PORT,
   persistBodies,
