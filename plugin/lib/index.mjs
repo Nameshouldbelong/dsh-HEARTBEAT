@@ -194,6 +194,8 @@ export function apply(ctx) {
   // 快照只缓存**昂贵的部分**（全量会话列表扫描，可能需要解压日志）；
   // 归档集合每次实时读（内存数组，成本≈0），所以归档/取消归档立刻生效。
   const snapshot = { allIds: new Set(), at: 0 };
+  // 快照最大陈旧时间；事件触发会立即刷新，这里只是兜底（正常远小于此）
+  const SNAPSHOT_TTL_MS = 60_000;
   const stopReconciler = startReconciler({
     ctx,
     statePath,
@@ -207,7 +209,11 @@ export function apply(ctx) {
   // 取「当前活跃会话集合」：快照（贵）− 实时归档集合（便宜）。
   const activeSessionIds = async () => {
     let all = snapshot.allIds;
-    if (!all || all.size === 0) {
+    // 2026-10-23 审计 T22/T23：旧实现只在"快照为空"时才重取，于是第一次成功
+    // 暖起来之后**再也不刷新** —— 新建/删除会话后面板一直显示旧列表。
+    // 改为：为空 或 超过 SNAPSHOT_TTL_MS 即重取（事件触发的 runOnce 会刷新它）。
+    const stale = !snapshot.at || (Date.now() - snapshot.at) > SNAPSHOT_TTL_MS;
+    if (!all || all.size === 0 || stale) {
       all = await getAllSessionIds(ctx);
       snapshot.allIds = all;
       snapshot.at = Date.now();
@@ -221,6 +227,15 @@ export function apply(ctx) {
   // 1b. 标题缓存的事件级失效（KI-4 + Rename 即时同步）
   // DSH 每次 Rename / 自动取名都会 append session/title 事件；订阅它精确清缓存，
   // 于是「轮询不重复解压日志」与「Rename 立刻生效」可以同时成立。
+  // 2026-10-23 审计 T22/T23：会话增删/归档事件到达时，**同步**把快照标记为陈旧，
+  // 使紧接着的一次 /heartbeat/api/state 立即重扫（不必等 TTL，也不依赖
+  // reconciler 异步跑完）。这是"面板与事实一致"的最短路径。
+  for (const evt of ['session/created', 'session/disposed', 'workspace/session-stop']) {
+    try {
+      ctx?.on?.(evt, () => { snapshot.at = 0; });
+    } catch {}
+  }
+
   try {
     const offTitle = ctx?.on?.('session/event', (session, event) => {
       if (event && event.type === 'session/title') {
@@ -468,13 +483,23 @@ export function apply(ctx) {
             sendJson(res, 400, { error: 'missing sessionId or intervalMin' });
             return;
           }
-          const text = await executeHto(String(intervalMin), sessionId, statePath);
+          // 2026-10-23 审计 T25：先校验参数，再执行副作用
           const parsed = parseHtoParam(String(intervalMin));
           if (!parsed.valid) {
-            sendJson(res, 400, { error: text });
+            sendJson(res, 400, { error: parsed.error || 'invalid interval' });
             return;
           }
+          const text = await executeHto(String(intervalMin), sessionId, statePath);
           const updated = readState(statePath).sessions[sessionId];
+          // 身份校验失败（verify 拒绝）必须报 HTTP 失败，不能 200 + ok:true
+          if (!updated || updated.on !== true) {
+            sendJson(res, 409, {
+              error: (updated && updated.verifyError) || 'interval 已拒绝',
+              text,
+              session: updated,
+            });
+            return;
+          }
           sendJson(res, 200, { ok: true, text, session: updated });
           return;
         }

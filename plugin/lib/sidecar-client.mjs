@@ -15,7 +15,13 @@ function sidecarRequest(endpoint, options = {}) {
         port: base.port,
         path: endpoint,
         method: options.method || 'GET',
-        headers: options.headers || {},
+        headers: options.body
+          // 2026-10-23 审计 T19：显式给 content-length。
+          // 否则 Node 用 transfer-encoding: chunked，经中间代理（gateway）转发时
+          // 代理补的 content-length 与原 chunked 头冲突，下游解析失败 → HTTP 400，
+          // 表现为"OFF 调用总是 400、关闭永远补偿不成功"。
+          ? { ...(options.headers || {}), 'content-length': Buffer.byteLength(options.body) }
+          : (options.headers || {}),
         timeout: options.timeout || 3000,
       },
       (res) => {
@@ -69,11 +75,19 @@ export async function sidecarSelfCheck() {
   return st.data?.selfCheck || null;
 }
 
-export async function sidecarControlOn(key, intervalMin = 30) {
+/**
+ * 开启保温（2026-10-23 审计第一批第 1 条：ensure / resume 分离）。
+ *
+ * @param {'ensure'|'resume'} action
+ *   'resume' = 用户显式开启，可解除可恢复熔断（低命中 / 403）。
+ *   'ensure' = 自动对账补挂，**不得**解除熔断；熔断中返回 409 breaker-open。
+ * 旧调用方不传 action 时按 'resume' 处理（保持向后兼容）。
+ */
+export async function sidecarControlOn(key, intervalMin = 30, action = 'resume') {
   return sidecarRequest('/control/on', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ key, intervalMin }),
+    body: JSON.stringify({ key, intervalMin, action }),
   });
 }
 

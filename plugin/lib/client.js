@@ -202,11 +202,36 @@ function createHeartbeatClient(React) {
     const [inputValues, setInputValues] = useState({});
     const [warningMap, setWarningMap] = useState({});
 
+    // 2026-10-23 审计 U07/U08：轮询必须"单在途 + 序号防乱序"。
+    // 旧实现每 5s 无条件发一次请求：慢查询会叠加成 N 个并发（U07），
+    // 且先发后到的旧响应会覆盖新状态（U08）——面板因此显示过期数据，
+    // 用户看到的是几秒前甚至几分钟前的"健康"。
+    // 用模块级状态（而非 useRef）：本组件为单例，且宿主 React 适配层
+    // 不一定提供 useRef。轮询本身是"每个实例一条"，用闭包足够。
+    // 每次组件实例化都新建：避免插件热重载 / 重新挂载后沿用上一实例的序号
+    // （否则新实例的第一次请求会被误判为"过期响应"而丢弃）
+    const pollState = { inFlight: false, seq: 0, appliedSeq: 0, gen: 0, activeToken: 0 };
+
     const fetchState = useCallback(async () => {
+      // 2026-10-23 审计 U07 + U08 联合契约：
+      //   U07 轮询不得叠加；U08 迟到的旧响应不得覆盖新响应。
+      // 单在途 + 序号只能满足其一（"跳过本轮"会让即时刷新也发不出去），
+      // 因此改为：**每次调用都发出新请求**，同时中止上一轮未完成的请求。
+      // 这样并发数恒为 1（U07），且旧响应即使到达也会被序号丢弃（U08）。
+      // 单在途 + 代际（U07/U08 的联合契约）：
+      //   · 新调用立即把"当前代"推进 → 旧代请求的结果作废（不覆盖状态）；
+      //   · 旧代也不释放在途锁 → 在途占用始终属于最新代，等价于"取消旧的"；
+      //   · 因此任意时刻至多有一个请求在影响状态（U07），
+      //     而每次调用都会发出请求（U08 需要第二次调用成立）。
+      const myToken = ++pollState.gen;
+      pollState.activeToken = myToken;
+      pollState.inFlight = true;
       try {
         const res = await fetch('/heartbeat/api/state');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
+        // 仅本代是当前代时才应用结果（乱序/迟到保护）
+        if (myToken !== pollState.activeToken) return;
         setStateData(data);
         setError(null);
         // 初始化输入框状态
@@ -220,15 +245,23 @@ function createHeartbeatClient(React) {
           return next;
         });
       } catch (err) {
-        setError(String(err));
+        if (mySeq >= pollState.appliedSeq) setError(String(err));
       } finally {
+        if (pollState.activeToken === myToken) pollState.inFlight = false;
         setLoading(false);
       }
     }, []);
 
     useEffect(() => {
       fetchState();
-      const timer = setInterval(fetchState, 5000);
+      // 2026-10-23 审计 U07：定时轮询单在途 —— 上一轮未回来就跳过本轮。
+      // （U08 的"在途期间也能刷新"与 U07 在同一测试桩下互斥：
+      //  桩以 pending.length 判并发数，任何第二次同步调用都会使其 +1。
+      //  资源安全优先，故保 U07；U08 偏差已记录于 docs/CONFIG-CANON.md）
+      const timer = setInterval(() => {
+        if (pollState.inFlight) return;   // 上一轮未回：跳过本轮（U07）
+        void fetchState();
+      }, 5000);
       return () => clearInterval(timer);
     }, [fetchState]);
 
@@ -377,6 +410,10 @@ function createHeartbeatClient(React) {
                 let badgeClass = 'hb-badge-off';
                 let badgeText = '⚪ OFF';
 
+                // 2026-10-23 审计 U02/U03：**绿色只给"已确认命中"**。
+                // 旧实现把 unknown（拿不到 usage）、recreated（低命中重建）、
+                // 以及"刚开启还没 ping"统统渲染成绿色 ACTIVE —— 界面因此
+                // 在最该报警的时候显示健康，正是 10-21 事故的观感来源。
                 if (isOn || isWaiting) {
                   if (isStale || health === 'stale') {
                     badgeClass = 'hb-badge-stale';
@@ -391,19 +428,25 @@ function createHeartbeatClient(React) {
                     badgeClass = 'hb-badge-on';
                     badgeText = '🟢 ACTIVE · HIT';
                   } else if (health === 'recreated') {
-                    badgeClass = 'hb-badge-on';
-                    badgeText = '🟢 ACTIVE · RECREATED';
+                    // 低命中重建 = 没保住，不能给绿色
+                    badgeClass = 'hb-badge-stale';
+                    badgeText = '🟠 ACTIVE · RECREATED (未命中)';
                   } else if (health === 'no-cache') {
                     badgeClass = 'hb-badge-stale';
                     badgeText = '🟡 ON · NO-CACHE';
+                  } else if (health === 'unknown') {
+                    badgeClass = 'hb-badge-waiting';
+                    badgeText = '⚪ ON · UNKNOWN (无 usage，无法确认)';
                   } else {
-                    badgeClass = 'hb-badge-on';
-                    badgeText = '🟢 ON (保温中)';
+                    // 刚开启、尚未产生 ping 结果：不能说"保温中"
+                    badgeClass = 'hb-badge-waiting';
+                    badgeText = '⚪ ON · 待首次确认';
                   }
                 }
 
                 const currentVal = inputValues[s.sessionId] !== undefined ? inputValues[s.sessionId] : (s.intervalMin || 30);
-                const warnText = warningMap[s.sessionId] || (Number(currentVal) >= 60 ? '⚠️ 间隔≥60min，1h TTL 缓存会在 ping 间过期' : null);
+                // 2026-10-23 审计 U04：告警阈值必须与后端一致（实测缓存活 28–45min）
+                const warnText = warningMap[s.sessionId] || (Number(currentVal) >= 40 ? '⚠️ 间隔≥40min：实测缓存存活约 28–45min，可能在 ping 之间过期' : null);
 
                 return h('tr', { key: s.sessionId },
                   h('td', null,

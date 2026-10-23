@@ -111,8 +111,20 @@ export async function executeHton(sessionId, statePath, opts = {}) {
 
   const expected = await resolveExpectedPromptTokens(sessionId, key, opts.expectedPromptTokens);
   const check = await verifyBinding(sessionId, key, { expectedPromptTokens: expected });
+  if (!check.ok && check.reason === 'no-request-recorded') {
+    // 2026-10-23 审计 T20：还没有请求体时，**必须把等待意图注册到 sidecar**，
+    // 而不是只在本地 state 里写个 waiting 字样。否则 sidecar 不知道有人想保温，
+    // 下一条真实请求到达也不会自动开循环 —— 用户以为开着，实际永远等不到。
+    const res = await sidecarControlOn(key, intervalMin, 'resume').catch(() => null);
+    const waiting = res != null && res.status === 409;
+    updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting });
+    if (res == null) {
+      return `⚠️ sidecar 未响应（已记录开启意图，reconciler 会补挂）`;
+    }
+    return `⏳ 已登记等待：该会话下一次真实请求到达后自动开始保温（间隔 ${intervalMin}min）`;
+  }
   if (!check.ok) {
-    // 校验失败不写 on:true —— 状态必须与事实一致
+    // 真打错对象：校验失败不写 on:true —— 状态必须与事实一致
     updateSessionState(statePath, sessionId, { key, on: false, waiting: false });
     return check.text;
   }
@@ -130,13 +142,31 @@ export async function executeHtoff(sessionId, statePath) {
   const state = readState(statePath);
   const key = state.sessions[sessionId]?.key || resolveSessionKey(sessionId);
 
-  updateSessionState(statePath, sessionId, { key, on: false, waiting: false });
+  // 先把"用户意图"落盘（desiredOn:false）。即便 OFF 请求失败，
+  // reconciler 也会按此意图继续补偿，直到 sidecar 确认停止。
+  updateSessionState(statePath, sessionId, {
+    key, on: false, waiting: false, desiredOn: false, offPending: true,
+  });
 
+  let ok = false;
+  let err = null;
   try {
-    await sidecarControlOff(key);
-  } catch {}
+    const res = await sidecarControlOff(key);
+    ok = res != null && res.status === 200;
+    if (!ok) err = `HTTP ${res == null ? 'no-response' : res.status}`;
+  } catch (e) {
+    err = String(e && e.message ? e.message : e);
+  }
 
-  return '💓 心跳已关闭';
+  if (ok) {
+    updateSessionState(statePath, sessionId, { offPending: false, offError: null });
+    return '💓 心跳已关闭';
+  }
+
+  // 2026-10-23 审计 T19：**不能谎报已关闭**。记录待补偿状态并如实回报，
+  // reconciler 会在控制端点恢复后重试 OFF。
+  updateSessionState(statePath, sessionId, { offPending: true, offError: err });
+  return `⏸ 已标记关闭，但 sidecar 未确认（${err}）——将自动重试`;
 }
 
 export async function executeHto(arg, sessionId, statePath, opts = {}) {

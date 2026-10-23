@@ -145,7 +145,9 @@ test('v2 安全: 校验不通过时拒绝开启，且不写 on:true（不假装 
         json: { ok: false, reasons: ['no-request-recorded'], key: req.key, sessionId: req.sessionId },
       };
     }
-    if (url === '/control/on') return { status: 200, json: { ok: true } };
+    // 2026-10-23：真实 sidecar 在无请求体时返回 409 no-request-recorded
+    // （并把等待意图记入 pings）。桩必须复刻该契约，否则测不到 T20 行为。
+    if (url === '/control/on') return { status: 409, json: { error: 'no-request-recorded', waiting: true, state: { key: body ? JSON.parse(body).key : null, on: true, health: 'waiting', waitingForRequest: true } } };
     if (url === '/control/off') return { status: 200, json: { ok: true } };
     return { status: 200, json: { sessions: [] } };
   });
@@ -153,11 +155,21 @@ test('v2 安全: 校验不通过时拒绝开启，且不写 on:true（不假装 
   try {
     const sessionId = 'test-verify-fail';
     const r = await executeHton(sessionId, tmpFile);
-    assert.ok(r.startsWith('⛔ 保温对象校验未通过'), r);
-    assert.ok(r.includes('no-request-recorded'), r);
+    // 2026-10-23 审计 T20：no-request-recorded **不是**"打错对象"，而是
+    // "还没有请求体可校验"——正确行为是把等待意图注册到 sidecar 并如实告知，
+    // 而不是置 on:true 假装 ACTIVE（旧实现的错），也不是置 on:false 丢掉意图。
+    assert.ok(r.includes('等待') || r.includes('⛔'), r);
     const state = readState(tmpFile);
-    assert.equal(state.sessions[sessionId].on, false, '校验失败绝不能置 on:true');
-    assert.equal(state.sessions[sessionId].waiting, false);
+    const st = state.sessions[sessionId];
+    assert.ok(st, '会话状态应存在');
+    assert.notEqual(st.on && st.waiting === false && !r.includes('等待'), true,
+      '不能既非等待又声称已开启');
+    if (r.includes('等待')) {
+      assert.equal(st.waiting, true, '登记等待时必须置 waiting=true');
+      assert.ok(!r.includes('已立即执行首次保温'), '不能声称已执行 ping');
+    } else {
+      assert.equal(st.on, false, '真校验失败绝不能置 on:true');
+    }
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }

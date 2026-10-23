@@ -217,6 +217,15 @@ const pingTimers = new Map(); // key -> Interval
 // 旧请求仍在途时新对象看不到锁 → 仍会并发。改为按 key 的独立集合。
 const inFlightKeys = new Set();
 const pendingPingKeys = new Set();
+// 2026-10-23 审计 T21：每 key 的"代数"。OFF/ON/改间隔/真实请求替换都会 +1，
+// 旧代在途响应的迟到回调据此识别自己已过期，**不得**清新代 timer/健康值。
+const keyGenerations = new Map();
+function bumpGeneration(key) {
+  const g = (keyGenerations.get(key) || 0) + 1;
+  keyGenerations.set(key, g);
+  return g;
+}
+function currentGeneration(key) { return keyGenerations.get(key) || 0; }
 
 // ── KI-2 修复（2026-10-21）：保温中的请求体落盘 ────────────────────────────
 // 原实现 recordedRequests 纯内存，sidecar 每次重启（部署/崩溃/系统重启）即丢失，
@@ -295,6 +304,8 @@ function persistBodies() {
         lastSeenMs: rec.lastSeenMs,
         updatedAt: now,
         on: onNow,
+        credentialRef: rec.credentialRef || null,
+        authScheme: rec.authScheme || null,
       };
       added++;
     }
@@ -336,6 +347,8 @@ function persistPings() {
         spentUsd: p.spentUsd || 0,
         consecutiveZeroCacheRead: p.consecutiveZeroCacheRead || 0,
         waitingForRequest: p.waitingForRequest === true,
+        autoOffedAt: p.autoOffedAt || null,
+        blockedReason: p.blockedReason || null,
         updatedAt: now,
       };
       live++;
@@ -364,6 +377,44 @@ function persistDeleteKey(key) {
   } catch (e) {}
 }
 
+/**
+ * ——— 2026-10-23 审计 T16：重启后重建认证 ———
+ * 只保存**凭据来源引用**（env 变量名），绝不落盘原始 Authorization 头。
+ */
+const CREDENTIAL_ENV_CANDIDATES = [
+  'KIMI_CODING_API_KEY', 'KIMI_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
+];
+
+function detectCredentialRef(headers) {
+  try {
+    const raw = headers && (headers.authorization || headers.Authorization);
+    if (!raw || typeof raw !== 'string') return null;
+    const token = raw.replace(/^(Bearer|Basic)\s+/i, '').trim();
+    if (!token) return null;
+    for (const name of CREDENTIAL_ENV_CANDIDATES) {
+      if (process.env[name] && process.env[name] === token) return name;
+    }
+    return 'client';
+  } catch { return null; }
+}
+
+function detectAuthScheme(headers) {
+  const raw = headers && (headers.authorization || headers.Authorization);
+  if (!raw || typeof raw !== 'string') return null;
+  const m = raw.match(/^(Bearer|Basic)\s+/i);
+  return m ? m[1] : null;
+}
+
+function buildRestoredHeaders(v) {
+  const h = {};
+  const ref = v && v.credentialRef;
+  if (ref && ref !== 'client' && /^[A-Z_][A-Z0-9_]*$/.test(ref)) {
+    const val = process.env[ref];
+    if (val) h.authorization = (v.authScheme || 'Bearer') + ' ' + val;
+  }
+  return h;
+}
+
 function loadPersistedBodies() {
   try {
     if (!fs.existsSync(PERSIST_FILE)) return 0;
@@ -376,7 +427,9 @@ function loadPersistedBodies() {
       recordedRequests.set(key, {
         body: Buffer.from(v.body, 'base64'),
         path: v.path,
-        headers: {},              // 头（含 auth）**不落盘**，ping 时用环境里的 key 重建
+        // 头（含 auth）**不落盘**；按 credentialRef 从环境重建（2026-10-23 审计 T16）。
+        // 旧实现留空 {}，恢复后的 ping 没有 Authorization → 上游 401 → 误触发熔断。
+        headers: buildRestoredHeaders(v),
         model: v.model,
         sessionId: v.sessionId || null,
         lastSeenMs: v.lastSeenMs || 0,
@@ -523,6 +576,8 @@ function loadPersistedPings() {
         consecutiveZeroCacheRead: v.consecutiveZeroCacheRead || 0,
         consecutiveTransportFailures: 0,
         spentUsd: v.spentUsd || 0,
+        autoOffedAt: v.autoOffedAt || null,
+        blockedReason: v.blockedReason || null,
       });
       if (hasBody) {
         const timer = setInterval(() => runPing(key), (v.intervalMin || 30) * 60 * 1000);
@@ -581,12 +636,22 @@ function estimatePingCostUsd(usage) {
 }
 
 function buildPingBody(recordedBuffer) {
+  // 2026-10-23 审计 T29：流式 Chat Completions 默认不回 usage，
+  // 于是 ping 永远拿不到缓存计数 → 被判 unknown（既不算命中也不算失败），
+  // 保温事实上失去观测能力。标准兼容做法是显式要求 usage 尾帧。
+
   // 2026-10-15 实测(Kimi coding 端点): max_tokens=1 的请求不参与前缀缓存(连发双 miss),
   // max_tokens=16/100/1024 均正常命中。ping 输出整体丢弃, 故固定 16(已验证可参与缓存的最低档),
   // 不再沿用原始请求的 max_tokens 也不钳 1024。其余字段一律保持原样
   // (含注入的 cache_control/user_id, 由记录时机保证已注入)。
   const j = JSON.parse(recordedBuffer.toString('utf8'));
   j.max_tokens = 16;
+  // 2026-10-23 审计 T29：流式请求必须显式索取 usage 尾帧，否则 ping 拿不到
+  // 缓存计数，只能判 unknown —— 保温失去观测能力（等于"悄悄地不生效"）。
+  // 非流式无需该字段；已显式设置过的保持原值。
+  if (j.stream === true) {
+    j.stream_options = Object.assign({}, j.stream_options, { include_usage: true });
+  }
   return Buffer.from(JSON.stringify(j), 'utf8');
 }
 
@@ -727,6 +792,7 @@ function runPing(key) {
     return;
   }
   inFlightKeys.add(key);
+  const myGeneration = currentGeneration(key);
 
   let pingBody;
   try {
@@ -771,6 +837,8 @@ function runPing(key) {
       pingState.stale = true;
       pingState.health = 'stale';
       pingState.on = false;
+      pingState.autoOffedAt = Date.now();
+      pingState.blockedReason = 'auth-error';
       if (pingTimers.has(key)) { clearInterval(pingTimers.get(key)); pingTimers.delete(key); }
       if (pingState.retryTimer) { clearTimeout(pingState.retryTimer); pingState.retryTimer = null; }
       console.log(`[ping] key=${key} AUTO-OFF: fatal auth/quota error ${errStr}`);
@@ -803,8 +871,32 @@ function runPing(key) {
     },
     (upRes) => {
       const respChunks = [];
+      // ── once-only finalize（2026-10-23 审计 F01）────────────────────────
+      // 旧实现只监听 'end'。响应断流（200 头 + 部分 body 后连接被关）时
+      // 'end' 永不触发 → releaseInFlight 永不调用 → 该 key 的锁永久占用，
+      // 之后所有 ping 都被"在途"挡掉，保温静默死亡。
+      // 现在 error / aborted / close 都进入同一终结器，且只执行一次。
+      let finalized = false;
+      const finalizeFailure = (why) => {
+        if (finalized) return;
+        finalized = true;
+        // 旧代迟到：不改新代状态，只释放属于本代的锁
+        if (myGeneration !== currentGeneration(key)) { releaseInFlight(key); return; }
+        try { onTransportFailure(502, 'stream-' + why); } catch {}
+        releaseInFlight(key);
+      };
       upRes.on('data', (c) => respChunks.push(c));
+      upRes.on('aborted', () => finalizeFailure('aborted'));
+      upRes.on('error', (e) => finalizeFailure('error:' + String(e && e.message ? e.message : e)));
+      upRes.on('close', () => {
+        // close 在正常结束后也会触发，仅当尚未 end 时视为异常
+        if (!finalized && !upRes.complete) finalizeFailure('close-incomplete');
+      });
       upRes.on('end', () => {
+        if (finalized) return;
+        finalized = true;
+        // 旧代迟到响应：丢弃，绝不覆盖新代健康值/计数/timer
+        if (myGeneration !== currentGeneration(key)) { releaseInFlight(key); return; }
         const txt = Buffer.concat(respChunks).toString('utf8');
         const usage = extractUsage(txt);
         const result = classifyPingResult(upRes.statusCode, usage);
@@ -857,6 +949,9 @@ function runPing(key) {
             pingState.stale = true;
             pingState.health = 'stale';
             pingState.on = false;
+            // 熔断标记（2026-10-23）：必须可持久，供 ensure 识别、UI 展示原因
+            pingState.autoOffedAt = Date.now();
+            pingState.blockedReason = 'low-hit';
             if (pingTimers.has(key)) {
               clearInterval(pingTimers.get(key));
               pingTimers.delete(key);
@@ -987,7 +1082,12 @@ const server = http.createServer((req, res) => {
           result.reasons.push('unparsable-recorded-body');
         }
         result.bodySessionId = bodySession;
-        if (sessionId && bodySession && bodySession !== sessionId) {
+        // 2026-10-23 审计 T30：**缺身份不能当作"通过"**。
+        // 旧实现只在 bodySession 存在且不等时才拒绝，于是"请求体里没有任何
+        // 会话标识"被默认放行 —— 而这正是最需要拒绝的情形（无法证明归属）。
+        if (!bodySession) {
+          result.reasons.push('identity-unavailable');
+        } else if (sessionId && bodySession !== sessionId) {
           result.reasons.push('session-id-mismatch');
         }
         // ③ prompt 量级校验
@@ -1026,6 +1126,8 @@ const server = http.createServer((req, res) => {
         health: p.health || null,
         spentUsd: Number((p.spentUsd || 0).toFixed(4)),
         waitingForRequest: p.waitingForRequest === true,
+        autoOffedAt: p.autoOffedAt || null,
+        blockedReason: p.blockedReason || null,
         retryCount: p.retryCount || 0,
         lastError: p.lastError || null,
         lastUsage: p.lastUsage,
@@ -1067,6 +1169,42 @@ const server = http.createServer((req, res) => {
       if (!Number.isInteger(intervalMin) || intervalMin < 1 || intervalMin > 720) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'invalid-interval' }));
+        return;
+      }
+
+      // ── ensure / resume 分离（2026-10-23 审计第一批第 1 条）──────────────
+      // 旧实现只有一个语义：无论谁来调用、无论是否已熔断，一律清 stale、重建
+      // 定时器并立即 ping。于是 reconciler 的自动补挂与用户的显式重开同义，
+      // **熔断被周期性对账绕过**（审计 T14/T15 用真实 sidecar 复现：上游请求 2→3）。
+      //
+      // 现在：
+      //   · action='ensure'（默认给插件对账用）——幂等补挂；**遇到熔断只回报现状，
+      //     不清 breaker、不重建 timer、不 ping**；
+      //   · action='resume'（用户显式开启）——允许解除可恢复熔断（低命中/403）。
+      // 为向后兼容，缺省按 'resume' 处理（旧调用方是"用户开启"语义），
+      // 但 reconciler 一律显式传 ensure。
+      const action = body.action === 'ensure' ? 'ensure' : 'resume';
+      const breakerOpen = (() => {
+        const p = pings.get(key);
+        if (!p) return false;
+        // 熔断判定：被自动关停过（autoOffedAt）或仍标记 stale/health=stale
+        return p.autoOffedAt != null || p.stale === true || p.health === 'stale';
+      })();
+
+      if (action === 'ensure' && breakerOpen) {
+        const p = pings.get(key);
+        res.writeHead(409, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: 'breaker-open',
+          blockedReason: p?.blockedReason || 'auto-off',
+          action,
+          state: {
+            key, on: p?.on === true, intervalMin: p?.intervalMin, stale: true,
+            health: 'stale', pingCount: p?.pingCount || 0,
+            autoOffedAt: p?.autoOffedAt || null,
+          },
+        }));
         return;
       }
       if (!recordedRequests.has(key)) {
@@ -1145,6 +1283,8 @@ const server = http.createServer((req, res) => {
       // 2026-10-20：完整重置路径必须继承失败计数——旧实现每次归零，
       // 而 reconciler 每分钟补挂一次，导致"连续 N 次 miss 自动关闭"永不触发。
       // stale 状态由显式 /control/on 清除（用户主动重开），但计数保留以便继续观察。
+      // resume：显式解除可恢复熔断（低命中 / 403）。清掉熔断标记。
+      // ensure 在此处不会被调用（已被上面的 breaker-open 分支拦下）。
       const state = {
         key,
         on: true,
@@ -1152,6 +1292,8 @@ const server = http.createServer((req, res) => {
         lastPingAt: existing.lastPingAt || null,
         pingCount: existing.pingCount || 0,
         stale: false,
+        autoOffedAt: null,
+        blockedReason: null,
         health: existing.health === 'waiting' ? null : (existing.health || null),
         waitingForRequest: false,
         lastUsage: existing.lastUsage || null,
@@ -1162,6 +1304,7 @@ const server = http.createServer((req, res) => {
         consecutiveTransportFailures: 0,
         spentUsd: existing.spentUsd || 0,
       };
+      bumpGeneration(key);   // T21：重开即新代，旧代迟到响应不得影响新代
       pings.set(key, state);
       const timer = setInterval(() => runPing(key), intervalMin * 60 * 1000);
       if (timer.unref) timer.unref();
@@ -1215,6 +1358,7 @@ const server = http.createServer((req, res) => {
         pingTimers.delete(key);
       }
       if (key && pings.has(key)) {
+        bumpGeneration(key);   // T21：旧代在途响应作废
         const p = pings.get(key);
         p.on = false;
         p.waitingForRequest = false;
@@ -1289,7 +1433,27 @@ const server = http.createServer((req, res) => {
             model: currentModel,
             sessionId: currentSessionId,
             lastSeenMs: Date.now(),
+            credentialRef: detectCredentialRef(req.headers),
+            authScheme: detectAuthScheme(req.headers),
           });
+          // ── waiting 意图迁移（2026-10-23 审计 T20）──────────────────────
+          // 开启保温时若还没有请求体，意图只能登记在"当时的 key"（可能是
+          // system-hash 兜底键）。真实请求带 session 标识到达后派生出的 key
+          // 与它不同，若不迁移，意图永远匹配不上 —— 表现为"登记了等待却永不恢复"。
+          if (!pings.has(currentKey) && currentSessionId) {
+            for (const [oldKey, p] of pings.entries()) {
+              if (p.waitingForRequest !== true || p.migratedTo) continue;
+              if (oldKey === currentKey) continue;
+              // 只迁移"等待中且无对应会话身份"的条目
+              pings.delete(oldKey);
+              if (pingTimers.has(oldKey)) { clearInterval(pingTimers.get(oldKey)); pingTimers.delete(oldKey); }
+              const migrated = { ...p, key: currentKey, waitingForRequest: true, migratedFrom: oldKey };
+              pings.set(currentKey, migrated);
+              console.log(`[ping] migrated waiting intent ${oldKey} -> ${currentKey} (session ${currentSessionId})`);
+              break;
+            }
+          }
+
           // 若有活跃 ping 循环但处于 stale 状态，真实流量到达时自动清 stale 并恢复循环
           if (pings.has(currentKey)) {
             const p = pings.get(currentKey);
