@@ -327,20 +327,27 @@ function persistPings() {
     const old = readJsonFile(PINGS_FILE, {});
     const merged = {};
 
-    // 保留磁盘上仍在 TTL 内、且内存里没有对应条目的旧记录（防止一次空扫描清空）
+    // 保留磁盘上仍在 TTL 内、且内存里没有对应条目的旧记录（防止一次空扫描清空）。
+    // 2026-10-24 独立审计修复：熔断记录（on=false 但带 autoOffedAt）同样保留 —— 
+    // runPing 的 auto-off 注释声称"熔断标记必须可持久，供 ensure 识别"，旧实现
+    // 在这里把它和用户显式 OFF 一起丢弃，重启后 ensure 的 breaker 判定失效。
     for (const [key, v] of Object.entries(old)) {
-      if (v && v.on && now - (v.updatedAt || 0) <= MAX_PERSIST_AGE_MS && !pings.has(key)) {
+      if (v && (v.on || v.autoOffedAt) && now - (v.updatedAt || 0) <= MAX_PERSIST_AGE_MS && !pings.has(key)) {
         merged[key] = v;
       }
     }
 
     let live = 0;
+    let breakers = 0;
     for (const [key, p] of pings.entries()) {
-      // 内存里**明确关掉**的 key：不写入（等同删除，这是唯一合法的删除途径）
-      if (!p || !p.on) continue;
+      if (!p) continue;
+      // 内存里**明确关掉**的 key：不写入（等同删除，这是唯一合法的删除途径）。
+      // 例外：被自动关停（熔断）的条目 on=false 但带 autoOffedAt —— 必须持久化，
+      // 否则 sidecar 重启后 reconciler 的 ensure 补挂会绕过熔断重新开 ping。
+      if (!p.on && !p.autoOffedAt) continue;
       merged[key] = {
         key,
-        on: true,
+        on: p.on === true,
         intervalMin: p.intervalMin,
         pingCount: p.pingCount || 0,
         lastPingAt: p.lastPingAt || null,
@@ -351,11 +358,11 @@ function persistPings() {
         blockedReason: p.blockedReason || null,
         updatedAt: now,
       };
-      live++;
+      if (p.on) live++; else breakers++;
     }
 
     writeJsonAtomic(PINGS_FILE, merged);
-    return { kept: Object.keys(merged).length, live };
+    return { kept: Object.keys(merged).length, live, breakers };
   } catch (e) {
     console.log('[persist] pings write failed:', String(e && e.message ? e.message : e));
     return null;
@@ -551,14 +558,43 @@ function runSelfCheck() {
  */
 function loadPersistedPings() {
   try {
-    if (!fs.existsSync(PINGS_FILE)) return { restored: 0, waiting: 0 };
+    if (!fs.existsSync(PINGS_FILE)) return { restored: 0, waiting: 0, breakers: 0 };
     const obj = JSON.parse(fs.readFileSync(PINGS_FILE, 'utf8'));
     const now = Date.now();
     let restored = 0;
     let waiting = 0;
+    let breakers = 0;
     for (const [key, v] of Object.entries(obj || {})) {
-      if (!v || !v.on) continue;
+      if (!v) continue;
       if (now - (v.updatedAt || 0) > MAX_PERSIST_AGE_MS) continue;
+      // 熔断记录（on=false 但带 autoOffedAt）：恢复为熔断态（on=false、stale），
+      // **不**启动 ping 循环 —— 让 /control/on 的 ensure 语义能识别到熔断并拒绝
+      // 补挂（2026-10-24 独立审计修复：旧实现直接跳过，重启后熔断丢失、
+      // ensure 以 full-reset 重新开 ping，违背"熔断必须可持久"的设计承诺）。
+      if (!v.on) {
+        if (!v.autoOffedAt) continue;   // 用户显式 OFF：不是熔断，无需恢复
+        pings.set(key, {
+          key,
+          on: false,
+          intervalMin: v.intervalMin || 30,
+          lastPingAt: v.lastPingAt || null,
+          pingCount: v.pingCount || 0,
+          stale: true,
+          health: 'stale',
+          waitingForRequest: false,
+          lastUsage: null,
+          lastError: null,
+          retryCount: 0,
+          retryTimer: null,
+          consecutiveZeroCacheRead: v.consecutiveZeroCacheRead || 0,
+          consecutiveTransportFailures: 0,
+          spentUsd: v.spentUsd || 0,
+          autoOffedAt: v.autoOffedAt,
+          blockedReason: v.blockedReason || 'auto-off',
+        });
+        breakers++;
+        continue;
+      }
       const hasBody = recordedRequests.has(key);
       pings.set(key, {
         key,
@@ -588,10 +624,10 @@ function loadPersistedPings() {
         waiting++;
       }
     }
-    return { restored, waiting };
+    return { restored, waiting, breakers };
   } catch (e) {
     console.log('[persist] pings load failed:', String(e && e.message ? e.message : e));
-    return { restored: 0, waiting: 0 };
+    return { restored: 0, waiting: 0, breakers: 0 };
   }
 }
 
@@ -1362,6 +1398,13 @@ const server = http.createServer((req, res) => {
         const p = pings.get(key);
         p.on = false;
         p.waitingForRequest = false;
+        // 2026-10-24 独立审计修复：显式 OFF 必须同时清熔断标记 ——
+        // persistPings 现在会把 on=false 且带 autoOffedAt 的条目当"熔断记录"
+        // 持久化；用户显式关闭后若不清除，persistDeleteKey + persistPings 的
+        // 组合会把已删条目作为熔断重新写回，且重启后被恢复成熔断态。
+        // 语义：用户显式 OFF 优先于熔断记忆（关闭即放弃对该 key 的一切管理）。
+        p.autoOffedAt = null;
+        p.blockedReason = null;
         if (p.retryTimer) {
           clearTimeout(p.retryTimer);
           p.retryTimer = null;
