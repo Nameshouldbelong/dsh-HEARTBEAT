@@ -67,7 +67,7 @@ curl -s http://127.0.0.1:8791/healthz | jq -r .buildSha
 sha256sum ~/DSH/插件制作/dsh-HEARTBEAT/sidecar/sidecar.js | cut -c1-12
 ```
 
-两者一致 = 线上就是刚推的那份代码。插件版本见 `plugin/package.json`（0.2.0）。
+两者一致 = 线上就是刚推的那份代码。插件版本见 `plugin/package.json` 与 `plugin/dsh.plugin.json`（两处必须一致，当前 0.2.1）。
 
 ## 缓存 TTL 的准确表述
 

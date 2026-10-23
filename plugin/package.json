@@ -1,6 +1,6 @@
 {
   "name": "dsh-heartbeat",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Session-level LLM prefix-cache keep-alive for DSH: HEARTBEAT tab + TG duty slash commands (/HTON /HTOFF /HTO)",
   "type": "module",
   "main": "lib/index.mjs",

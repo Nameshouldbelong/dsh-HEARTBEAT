@@ -1,6 +1,6 @@
 {
   "id": "dsh-external/dsh-heartbeat",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "main": "./lib/index.mjs",
   "description": "HEARTBEAT——会话级 LLM 前缀缓存保温：顶部栏 tab 点选 ON/OFF、可调心跳间隔，TG duty 斜杠指令 /HTON /HTOFF /HTO",
   "engines": {

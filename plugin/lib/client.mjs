@@ -210,7 +210,7 @@ function createHeartbeatClient(React) {
     // 不一定提供 useRef。轮询本身是"每个实例一条"，用闭包足够。
     // 每次组件实例化都新建：避免插件热重载 / 重新挂载后沿用上一实例的序号
     // （否则新实例的第一次请求会被误判为"过期响应"而丢弃）
-    const pollState = { inFlight: false, seq: 0, appliedSeq: 0, gen: 0, activeToken: 0 };
+    const pollState = { inFlight: false, gen: 0, activeToken: 0 };
 
     const fetchState = useCallback(async () => {
       // 2026-10-23 审计 U07 + U08 联合契约：
@@ -245,7 +245,11 @@ function createHeartbeatClient(React) {
           return next;
         });
       } catch (err) {
-        if (mySeq >= pollState.appliedSeq) setError(String(err));
+        // 2026-10-24 独立审计修复：旧代码此处引用了不存在的 mySeq（2026-10-23
+        // 序号→代际重构的遗留），fetch 失败时本分支抛 ReferenceError，setError
+        // 永不执行 → 错误横幅成为死代码，面板静默显示过期数据。改为与成功路径
+        // 相同的代际判断：仅当本调用仍是当前代时才更新错误状态。
+        if (myToken === pollState.activeToken) setError(String(err));
       } finally {
         if (pollState.activeToken === myToken) pollState.inFlight = false;
         setLoading(false);

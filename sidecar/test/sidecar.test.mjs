@@ -1680,3 +1680,92 @@ test('审计二-5: 请求在途时重新 /control/on —— 全局锁必须仍�
   sidecar.inFlightKeys.delete(key);
   sidecar.pendingPingKeys.delete(key);
 });
+
+test('2026-10-24 独立审计: 熔断（auto-off）状态必须跨重启持久化，ensure 不得绕过', async () => {
+  const fs = await import('node:fs');
+  const key = 'dshsc-5555555555555555';
+  const userOffKey = 'dshsc-6666666666666666';
+  const file = sidecar.PINGS_FILE;
+
+  try {
+    // 场景 1：auto-off（低命中熔断）——on=false 但带 autoOffedAt
+    sidecar.recordedRequests.set(key, {
+      body: Buffer.from(JSON.stringify({ model: 'k3', messages: [{ role: 'user', content: 'x' }] })),
+      path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: 0,
+    });
+    sidecar.pings.set(key, {
+      key, on: false, intervalMin: 30, pingCount: 7, stale: true, health: 'stale',
+      waitingForRequest: false, consecutiveZeroCacheRead: 1,
+      autoOffedAt: 1770000000000, blockedReason: 'low-hit', spentUsd: 0.01,
+    });
+    // 场景 2：用户显式 OFF——on=false 且无 autoOffedAt（合法删除，不得复活）
+    sidecar.pings.set(userOffKey, { key: userOffKey, on: false, intervalMin: 30, pingCount: 2 });
+
+    sidecar.persistPings();
+    const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.ok(written[key] && written[key].autoOffedAt, '熔断条目必须持久化（供重启后 ensure 识别）');
+    assert.equal(written[key].blockedReason, 'low-hit');
+    assert.equal(written[userOffKey], undefined, '用户显式 OFF 的条目不得写盘（删除即删除）');
+
+    // 模拟重启：清空内存 → 恢复
+    sidecar.pings.clear();
+    sidecar.pingTimers.clear();
+    const r = sidecar.loadPersistedPings();
+    assert.ok(r.breakers >= 1, '恢复时应报告熔断条目数');
+
+    const p = sidecar.pings.get(key);
+    assert.ok(p, '熔断条目应被恢复');
+    assert.equal(p.on, false, '熔断恢复后仍应为关闭态');
+    assert.equal(p.stale, true);
+    assert.equal(p.autoOffedAt, 1770000000000, '熔断时间戳必须延续');
+    assert.equal(p.blockedReason, 'low-hit');
+    assert.equal(sidecar.pingTimers.has(key), false, '熔断条目不得启动 ping 循环');
+    assert.equal(sidecar.pings.has(userOffKey), false, '用户 OFF 条目不得被恢复');
+
+    // ensure 语义必须被熔断挡下（resume 仍可显式解除）
+    // （HTTP 层 409 breaker-open 的行为已由 A5 系列与 audit 测试覆盖，这里钉住数据层）
+  } finally {
+    sidecar.pings.delete(key);
+    sidecar.pings.delete(userOffKey);
+    sidecar.recordedRequests.delete(key);
+    if (sidecar.pingTimers.has(key)) { clearInterval(sidecar.pingTimers.get(key)); sidecar.pingTimers.delete(key); }
+    try { fs.rmSync(file, { force: true }); } catch {}
+  }
+});
+
+test('2026-10-24 独立审计: /control/off 显式关闭必须清除熔断标记（不得被 persistPings 复活为熔断记录）', async () => {
+  const fs = await import('node:fs');
+  const key = 'dshsc-7777777777777777';
+  const file = sidecar.PINGS_FILE;
+
+  try {
+    sidecar.recordedRequests.set(key, {
+      body: Buffer.from(JSON.stringify({ model: 'k3', messages: [{ role: 'user', content: 'x' }] })),
+      path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: 0,
+    });
+    // 熔断态
+    sidecar.pings.set(key, {
+      key, on: false, intervalMin: 30, stale: true, health: 'stale',
+      autoOffedAt: 1770000000001, blockedReason: 'low-hit',
+    });
+    sidecar.persistPings();
+    assert.ok(JSON.parse(fs.readFileSync(file, 'utf8'))[key], '前置：熔断在盘');
+
+    // 显式 OFF：等价于 /control/off handler 的内存操作 + persistDeleteKey + persistPings
+    const p = sidecar.pings.get(key);
+    p.on = false; p.waitingForRequest = false; p.autoOffedAt = null; p.blockedReason = null;
+    sidecar.persistDeleteKey(key);
+    sidecar.persistPings();
+    const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(written[key], undefined, '显式 OFF 后不得以任何形态回到 pings.json');
+
+    // 重启恢复也不得复活
+    sidecar.pings.clear();
+    sidecar.loadPersistedPings();
+    assert.equal(sidecar.pings.has(key), false, '显式 OFF 的 key 不得被恢复');
+  } finally {
+    sidecar.pings.delete(key);
+    sidecar.recordedRequests.delete(key);
+    try { fs.rmSync(file, { force: true }); } catch {}
+  }
+});
