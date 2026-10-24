@@ -1973,9 +1973,48 @@ test('tool-gate: 端到端——出站剥除、录制体==出站体（ping 重�
 });
 
 // ── 区间突发引擎（2026-10-25）──────────────────────────────────────────────
+function makeBurstHarness(t, upstreamHandler) {
+  return (async () => {
+    const mockUpstream = http.createServer(upstreamHandler);
+    await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+    process.env.UPSTREAM_HOST = '127.0.0.1';
+    process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+    process.env.UPSTREAM_PROTOCOL = 'http';
+    process.env.UPSTREAM_PREFIX = '/coding';
+    await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+    const port = sidecar.server.address().port;
+    const saved = { ...sidecar.config };
+    t.after(() => {
+      Object.assign(sidecar.config, saved);
+      mockUpstream.close();
+      sidecar.server.close();
+    });
+    const post = (path, obj) => new Promise((resolve, reject) => {
+      const req = http.request(
+        { hostname: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
+        (res) => {
+          const c = [];
+          res.on('data', (x) => c.push(x));
+          res.on('end', () => {
+            try { resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(c).toString('utf8')) }); }
+            catch (e) { reject(e); }
+          });
+        }
+      );
+      req.on('error', reject);
+      req.end(JSON.stringify(obj));
+    });
+    const stateOf = async (key) => {
+      const r = await post.__stateGet(port, key);
+      return r;
+    };
+    return { mockUpstream, port, post, saved };
+  })();
+}
+
 test('window-burst: 窗口右端耗尽后停止尝试（window-expired），本周期不再发 ping', async (t) => {
   let upstreamPings = 0;
-  const mockUpstream = http.createServer((req, res) => {
+  const h = await makeBurstHarness(t, (req, res) => {
     req.resume();
     req.on('end', () => {
       upstreamPings++;
@@ -1983,29 +2022,7 @@ test('window-burst: 窗口右端耗尽后停止尝试（window-expired），本�
       res.end(JSON.stringify({ error: { type: 'rate_limit', message: 'engine overloaded' } }));
     });
   });
-  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
-  process.env.UPSTREAM_HOST = '127.0.0.1';
-  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
-  process.env.UPSTREAM_PROTOCOL = 'http';
-  process.env.UPSTREAM_PREFIX = '/coding';
-  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
-  const port = sidecar.server.address().port;
-  const saved = { ...sidecar.config };
   sidecar.config.burstIntervalMs = 40;
-  t.after(() => {
-    Object.assign(sidecar.config, saved);
-    mockUpstream.close();
-    sidecar.server.close();
-  });
-
-  const post = (path, obj) => new Promise((resolve) => {
-    const req = http.request(
-      { hostname: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
-      (res) => { const c = []; res.on('data', (x) => c.push(x)); res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(c).toString('utf8'))) })); }
-    );
-    req.end(JSON.stringify(obj));
-  });
-  const stateOf = async (key) => (await (await fetch(`http://127.0.0.1:${port}/control/state`)).json()).pings.find((x) => x.key === key) || null;
 
   const key = 'dshsc-windowexpire01';
   sidecar.recordedRequests.set(key, {
@@ -2013,14 +2030,20 @@ test('window-burst: 窗口右端耗尽后停止尝试（window-expired），本�
     path: '/v1/chat/completions', headers: {}, model: 'k3.1-pro', lastSeenMs: Date.now(),
   });
   // 窗口 0.1-0.4 分钟（6s-24s），锚点=现在；burst 步进 40ms
-  const on = await post('/control/on', { key, windowStartMin: 0.1, windowEndMin: 0.4 });
+  const on = await h.post('/control/on', { key, windowStartMin: 0.1, windowEndMin: 0.4 });
   assert.equal(on.status, 200);
 
-  // 等窗口耗尽（immediate probe + 6s 后突发到 24s；上限 ~26s）
+  const fetchState = async () => {
+    const r = await fetch(`http://127.0.0.1:${h.port}/control/state`);
+    const j = await r.json();
+    return j.pings.find((x) => x.key === key) || null;
+  };
+
+  // 等窗口耗尽（immediate probe + 6s 后突发至 24s；上限 ~28s）
   const t0 = Date.now();
   let st = null;
-  while (Date.now() - t0 < 30000) {
-    st = await stateOf(key);
+  while (Date.now() - t0 < 28000) {
+    st = await fetchState();
     if (st && st.health === 'window-expired') break;
     await new Promise((r) => setTimeout(r, 200));
   }
@@ -2030,7 +2053,7 @@ test('window-burst: 窗口右端耗尽后停止尝试（window-expired），本�
   assert.ok(st.burst.attempts >= 3, `突发内应多次尝试（实际 ${st.burst.attempts}）`);
   const pingsAtExpiry = upstreamPings;
 
-  // 耗尽后不再有新尝试（下一窗口在 0.1min≈6s 后才开——观察 3s 内计数不变）
+  // 耗尽后不再有新尝试（下一窗口 6s 后才开——观察 3s 内计数不变）
   await new Promise((r) => setTimeout(r, 3000));
   assert.equal(upstreamPings, pingsAtExpiry, '窗口右端之后不得再尝试');
   sidecar.clearPingTimers(key);
@@ -2039,15 +2062,12 @@ test('window-burst: 窗口右端耗尽后停止尝试（window-expired），本�
 });
 
 test('window-burst: /control/on 窗口参数校验（invalid-window / 旧 intervalMin 映射）', async (t) => {
-  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
-  const port = sidecar.server.address().port;
-  t.after(() => sidecar.server.close());
-  const post = (path, obj) => new Promise((resolve) => {
-    const req = http.request(
-      { hostname: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
-      (res) => { const c = []; res.on('data', (x) => c.push(x)); res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(c).toString('utf8'))) })); }
-    );
-    req.end(JSON.stringify(obj));
+  const h = await makeBurstHarness(t, (req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ usage: { prompt_tokens: 10, cached_tokens: 10 } }));
+    });
   });
 
   const key = 'dshsc-windowparam01';
@@ -2056,11 +2076,11 @@ test('window-burst: /control/on 窗口参数校验（invalid-window / 旧 interv
     path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: Date.now(),
   });
   // 起止倒挂 → 400
-  const bad = await post('/control/on', { key, windowStartMin: 30, windowEndMin: 20 });
+  const bad = await h.post('/control/on', { key, windowStartMin: 30, windowEndMin: 20 });
   assert.equal(bad.status, 400);
   assert.equal(bad.json.error, 'invalid-window');
   // 旧 intervalMin 40 → 窗口 30-40
-  const ok = await post('/control/on', { key, intervalMin: 40 });
+  const ok = await h.post('/control/on', { key, intervalMin: 40 });
   assert.equal(ok.status, 200);
   assert.equal(ok.json.state.windowStartMin, 30, '旧 intervalMin=N 应映射 [N-10, N]');
   assert.equal(ok.json.state.windowEndMin, 40);

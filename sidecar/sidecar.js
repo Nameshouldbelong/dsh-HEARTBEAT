@@ -928,6 +928,7 @@ function burstStep(key) {
   if (Date.now() >= st.burst.deadlineMs) {
     st.health = 'window-expired';
     if (!st.lastError) st.lastError = 'window-expired';
+    st.lastBurstAttempts = st.burst.attempts || 0;
     st.burst = null;
     st.anchorMs = Date.now();   // 下一周期从窗口耗尽时刻重新起算
     clearPingTimers(key);
@@ -1389,7 +1390,7 @@ const server = http.createServer((req, res) => {
           active: true,
           attempts: p.burst.attempts,
           deadlineAt: new Date(p.burst.deadlineMs).toISOString(),
-        } : { active: false, attempts: 0, deadlineAt: null },
+        } : { active: false, attempts: p.lastBurstAttempts || 0, deadlineAt: null },
         lastPingAt: p.lastPingAt,
         pingCount: p.pingCount,
         stale: p.stale,
