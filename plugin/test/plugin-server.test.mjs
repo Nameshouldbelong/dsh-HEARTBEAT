@@ -178,31 +178,31 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
     assert.equal(res3.result.statusCode, 200);
     assert.equal(res3.result.json.session.intervalMin, 60);
 
-    // 4. 测试平台命令: /hton
+    // 4. 测试平台命令: /hton（无参数 → 默认 20-30）
     const htonCmd = registeredCommands.get('hton');
     const htonRes = await htonCmd.handler({
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htonRes.kind, 'success');
-    assert.ok(htonRes.text.startsWith('💓 心跳已开启（间隔 60min'), htonRes.text);
+    assert.ok(htonRes.text.startsWith('💓 心跳已开启（窗口 20-30min'), htonRes.text);
 
-    // 5. 测试平台命令: /hto 30
+    // 5. 测试平台命令: /hto 15-20
     const htoCmd = registeredCommands.get('hto');
     const htoRes = await htoCmd.handler({
-      rawInput: '30',
+      rawInput: '15-20',
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htoRes.kind, 'success');
-    assert.ok(htoRes.text.startsWith('💓 心跳间隔已设为 30min 并开启'), htoRes.text);
+    assert.ok(htoRes.text.startsWith('💓 心跳窗口已设为 15-20min 并开启'), htoRes.text);
 
-    // 6. 测试平台命令: /hto 60 (>=60min 触发 1h TTL 告警)
+    // 6. 测试平台命令: /hto 50-60 (右端≥40min 触发缓存寿命告警)
     const hto60Res = await htoCmd.handler({
-      rawInput: '60',
+      rawInput: '50-60',
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(hto60Res.kind, 'success');
-    assert.ok(hto60Res.text.includes('💓 心跳间隔已设为 60min 并开启'));
-    assert.ok(hto60Res.text.includes('⚠️ 间隔≥40min'), hto60Res.text);
+    assert.ok(hto60Res.text.includes('💓 心跳窗口已设为 50-60min 并开启'));
+    assert.ok(hto60Res.text.includes('⚠️ 窗口右端≥40min'), hto60Res.text);
 
     // 7. 测试平台命令: /hto invalid (非法参数)
     const htoErrRes = await htoCmd.handler({
@@ -210,7 +210,7 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htoErrRes.kind, 'error');
-    assert.equal(htoErrRes.text, '用法：/HTO <分钟>（1-720），如 /HTO 60');
+    assert.equal(htoErrRes.text, '用法：/HTON [起-止]（分钟，1-720，如 20-30；不带参数默认 20-30）');
 
     // 8. 测试平台命令: /htoff
     const htoffCmd = registeredCommands.get('htoff');

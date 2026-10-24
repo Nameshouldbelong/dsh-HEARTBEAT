@@ -43,15 +43,23 @@ const defaultBehavior = (url, body) => {
   return { status: 404, json: {} };
 };
 
-test('Contract-E: parseHtoParam 参数解析', () => {
-  const usage = '用法：/HTO <分钟>（1-720），如 /HTO 60';
+test('Contract-E: parseHtoParam 参数解析（2026-10-25 区间窗口版）', () => {
+  const usage = '用法：/HTON [起-止]（分钟，1-720，如 20-30；不带参数默认 20-30）';
 
-  assert.deepEqual(parseHtoParam('1'), { valid: true, minutes: 1 });
-  assert.deepEqual(parseHtoParam('50'), { valid: true, minutes: 50 });
-  assert.deepEqual(parseHtoParam('60'), { valid: true, minutes: 60 });
-  assert.deepEqual(parseHtoParam('720'), { valid: true, minutes: 720 });
-  assert.deepEqual(parseHtoParam('  60'), { valid: true, minutes: 60 });
-  assert.deepEqual(parseHtoParam('   50   '), { valid: true, minutes: 50 });
+  // 空 → 默认 20-30
+  assert.deepEqual(parseHtoParam(''), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam('   '), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam(null), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam(undefined), { valid: true, startMin: 20, endMin: 30 });
+  // 区间
+  assert.deepEqual(parseHtoParam('20-30'), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam('15-20'), { valid: true, startMin: 15, endMin: 20 });
+  assert.deepEqual(parseHtoParam('  20-30'), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam('1-720'), { valid: true, startMin: 1, endMin: 720 });
+  // 旧单值兼容：N → [N-10, N]
+  assert.deepEqual(parseHtoParam('30'), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam('50'), { valid: true, startMin: 40, endMin: 50 });
+  assert.deepEqual(parseHtoParam('720'), { valid: true, startMin: 710, endMin: 720 });
 
   assert.deepEqual(parseHtoParam('0'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('721'), { valid: false, error: usage });
@@ -61,9 +69,10 @@ test('Contract-E: parseHtoParam 参数解析', () => {
   assert.deepEqual(parseHtoParam('60min'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('50.5'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('50 30'), { valid: false, error: usage });
-  assert.deepEqual(parseHtoParam(''), { valid: false, error: usage });
-  assert.deepEqual(parseHtoParam(null), { valid: false, error: usage });
-  assert.deepEqual(parseHtoParam(undefined), { valid: false, error: usage });
+  assert.deepEqual(parseHtoParam('30-20'), { valid: false, error: usage }, '起止倒挂非法');
+  assert.deepEqual(parseHtoParam('0-5'), { valid: false, error: usage }, '左端<1 非法');
+  assert.deepEqual(parseHtoParam('5-5'), { valid: false, error: usage }, '起==止 非法');
+  assert.deepEqual(parseHtoParam('10'), { valid: false, error: usage }, '旧单值 N<11 无法构成窗口');
 });
 
 test('v2 keys: key 只由 sessionId 决定（同一会话恒定、不同会话必不同）', () => {
@@ -86,12 +95,13 @@ test('Contract-E: /HTON, /HTOFF, /HTO 回执与状态变更', async (t) => {
     const sessionId = 'test-duty-session-1';
     const expectedKey = sessionKeyFor(sessionId);
 
-    // 1. /HTON 开启（默认 30min）
-    const r1 = await executeHton(sessionId, tmpFile);
-    assert.ok(r1.startsWith('💓 心跳已开启（间隔 30min'), r1);
+    // 1. /HTON 不带参数（默认窗口 20-30）
+    const r1 = await executeHton(sessionId, tmpFile, {});
+    assert.ok(r1.startsWith('💓 心跳已开启（窗口 20-30min'), r1);
     let state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].on, true);
-    assert.equal(state.sessions[sessionId].intervalMin, 30);
+    assert.equal(state.sessions[sessionId].windowStartMin, 20);
+    assert.equal(state.sessions[sessionId].windowEndMin, 30);
     assert.equal(state.sessions[sessionId].waiting, false);
     assert.equal(state.sessions[sessionId].key, expectedKey, 'key 必须是会话派生值');
 
@@ -101,35 +111,35 @@ test('Contract-E: /HTON, /HTOFF, /HTO 回执与状态变更', async (t) => {
     state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].on, false);
 
-    // 3. /HTO 30 设间隔并开启
-    const r3 = await executeHto('30', sessionId, tmpFile);
-    assert.ok(r3.startsWith('💓 心跳间隔已设为 30min 并开启'), r3);
+    // 3. /HTON 15-20 带区间参数
+    const r3 = await executeHton(sessionId, tmpFile, { windowArg: '15-20' });
+    assert.ok(r3.startsWith('💓 心跳已开启（窗口 15-20min'), r3);
     state = readState(tmpFile);
-    assert.equal(state.sessions[sessionId].on, true);
-    assert.equal(state.sessions[sessionId].intervalMin, 30);
+    assert.equal(state.sessions[sessionId].windowStartMin, 15);
+    assert.equal(state.sessions[sessionId].windowEndMin, 20);
 
-    // 4. /HTO 60 触发缓存寿命告警（实测存活 28–45min）
-    const r4 = await executeHto('60', sessionId, tmpFile);
-    assert.ok(r4.includes('💓 心跳间隔已设为 60min 并开启'), r4);
-    assert.ok(r4.includes('⚠️ 间隔≥40min'), r4);
+    // 4. /HTO 50-60 触发缓存寿命告警（实测存活 28–45min）
+    const r4 = await executeHto('50-60', sessionId, tmpFile);
+    assert.ok(r4.includes('💓 心跳窗口已设为 50-60min 并开启'), r4);
+    assert.ok(r4.includes('⚠️ 窗口右端≥40min'), r4);
     state = readState(tmpFile);
-    assert.equal(state.sessions[sessionId].intervalMin, 60);
+    assert.equal(state.sessions[sessionId].windowEndMin, 60);
 
-    // 5. /HTO 含空格参数
+    // 5. /HTO 旧单值 45 兼容（→ 35-45）
     const r5 = await executeHto('  45  ', sessionId, tmpFile);
-    assert.ok(r5.startsWith('💓 心跳间隔已设为 45min 并开启'), r5);
+    assert.ok(r5.startsWith('💓 心跳窗口已设为 35-45min 并开启'), r5);
     state = readState(tmpFile);
-    assert.equal(state.sessions[sessionId].intervalMin, 45);
+    assert.equal(state.sessions[sessionId].windowEndMin, 45);
 
     // 6. /HTO 错误参数 -> 不变更状态
     const r6 = await executeHto('invalid', sessionId, tmpFile);
-    assert.equal(r6, '用法：/HTO <分钟>（1-720），如 /HTO 60');
+    assert.equal(r6, '用法：/HTON [起-止]（分钟，1-720，如 20-30；不带参数默认 20-30）');
     state = readState(tmpFile);
-    assert.equal(state.sessions[sessionId].intervalMin, 45);
+    assert.equal(state.sessions[sessionId].windowEndMin, 45);
 
-    // 7. /HTON 沿用现有间隔
-    const r7 = await executeHton(sessionId, tmpFile);
-    assert.ok(r7.startsWith('💓 心跳已开启（间隔 45min'), r7);
+    // 7. /HTON 不带参数 → 默认 20-30（用户口径：不携带数值即默认区间）
+    const r7 = await executeHton(sessionId, tmpFile, {});
+    assert.ok(r7.startsWith('💓 心跳已开启（窗口 20-30min'), r7);
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }

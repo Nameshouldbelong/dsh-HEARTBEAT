@@ -323,7 +323,7 @@ test('B1-B4: HTTP 端点 /healthz, /sessions, /control/on, /control/off, /contro
   // 再次获取 state，验证 ping 计数与使用量已更新
   const stateResAfterPing = await request('/control/state');
   const pingItemAfterPing = stateResAfterPing.json.pings.find((p) => p.key === recordedKey);
-  assert.equal(pingItemAfterPing.pingCount, 1);
+  assert.ok(pingItemAfterPing.pingCount >= 1, "immediate ping 应已完成（waiting 迁移的立即探测可能再加一次）");
   assert.ok(pingItemAfterPing.lastPingAt);
   assert.equal(pingItemAfterPing.lastUsage?.cache_read_input_tokens, 450);
 
@@ -429,9 +429,9 @@ test('P0 集成: immediate ping / max_tokens=16 / 429 快速 retry / waiting 自
   await new Promise((resolve) => sidecar.server.listen(0, '127.0.0.1', resolve));
   const sidecarPort = sidecar.server.address().port;
 
-  // 注入短计时：retry +30ms/+60ms；禁用 10s 顺延保护
+  // 注入短计时：突发步进 30ms（原 +2/+4min retry 模型已删除）
   const savedConfig = { ...sidecar.config };
-  sidecar.config.retryDelaysMs = [30, 60];
+  sidecar.config.burstIntervalMs = 30;
   sidecar.config.recencyWindowMs = 0;
 
   t.after(() => {
@@ -512,7 +512,8 @@ test('P0 集成: immediate ping / max_tokens=16 / 429 快速 retry / waiting 自
   assert.deepEqual(pingReq.cache_control, { type: 'ephemeral', ttl: '1h' });
   assert.equal(pingReq.metadata.user_id, keyT1);
 
-  // --- Test 5: HTTP 429 = transport/API 错误 -> 进入 retry，不计入 cache 失败
+  // --- Test 5 (2026-10-25 区间突发版): 429 = engine 超负荷 → retrying，不计 cache 失败；
+  //     突发窗口内由 5s 节奏自动重试（scheduleRetry/+2+4min 重试模型已删除）
   responder = () => ({ status: 429, json: { error: { type: 'rate_limit' } } });
   sidecar.runPing(keyT1);
   const stRetry = await waitFor(async () => {
@@ -520,19 +521,28 @@ test('P0 集成: immediate ping / max_tokens=16 / 429 快速 retry / waiting 自
     return p && p.health === 'retrying' ? p : null;
   });
   assert.ok(stRetry, '429 后应进入 retrying');
-  assert.equal(stRetry.retryCount, 1);
   const rawT1 = sidecar.pings.get(keyT1);
   assert.equal(rawT1.consecutiveZeroCacheRead, 0, '429 不得计入 cache-zero 失败计数');
   assert.equal(rawT1.consecutiveTransportFailures, 1);
+  assert.equal(rawT1.on, true, '429 绝不触发自动关闭');
 
-  // --- Test 6: retry 成功 -> 恢复 hit，非 stale，retry 计数清零
-  responder = () => ({ status: 200, json: { id: 'm', type: 'message', usage: { input_tokens: 500, cache_read_input_tokens: 460, cache_creation_input_tokens: 0, output_tokens: 16 } } });
+  // --- Test 6 (区间突发): 突发窗口内 429×2 后 200-hit → 突发自动恢复 hit
+  let fourTwos = 0;
+  responder = () => {
+    if (fourTwos < 2) { fourTwos++; return { status: 429, json: { error: { type: 'rate_limit' } } }; }
+    return { status: 200, json: { id: 'm', type: 'message', usage: { input_tokens: 500, cache_read_input_tokens: 460, cache_creation_input_tokens: 0, output_tokens: 16 } } };
+  };
+  const rawForBurst = sidecar.pings.get(keyT1);
+  rawForBurst.anchorMs = Date.now() - 1000; // 窗口即刻开
+  sidecar.startBurst(keyT1);
   const stHit = await waitFor(async () => {
     const p = await pingStateOf(keyT1);
-    return p && p.health === 'hit' && p.retryCount === 0 ? p : null;
-  });
-  assert.ok(stHit, 'retry 成功应恢复 ACTIVE(hit)');
+    return p && p.health === 'hit' ? p : null;
+  }, 8000);
+  assert.ok(stHit, '突发窗口内 429 后应自动恢复 hit（5s 节奏重试）');
+  assert.ok(fourTwos >= 2, '前两次 429 已被尝试');
   assert.equal(stHit.stale, false);
+  assert.equal(sidecar.pings.get(keyT1).burst, null, '成功后突发结束');
   await request('/control/off', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -653,7 +663,7 @@ test('P0 回归: /control/on 幂等——reconciler 每分钟补挂不得白 pin
   const sidecarPort = sidecar.server.address().port;
 
   const savedConfig = { ...sidecar.config };
-  sidecar.config.retryDelaysMs = [40, 80];
+  sidecar.config.burstIntervalMs = 40;
   sidecar.config.recencyWindowMs = 0;
 
   t.after(() => {
@@ -692,10 +702,10 @@ test('P0 回归: /control/on 幂等——reconciler 每分钟补挂不得白 pin
     const r = await request('/control/state');
     return r.json.pings.find((x) => x.key === key) || null;
   };
-  const onKey = (key, intervalMin) => request('/control/on', {
+  const onKey = (key, intervalMin, action) => request('/control/on', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ key, intervalMin }),
+    body: JSON.stringify(action ? { key, intervalMin, action } : { key, intervalMin }),
   });
 
   const keyI = 'test-key-idempotent';
@@ -717,42 +727,48 @@ test('P0 回归: /control/on 幂等——reconciler 每分钟补挂不得白 pin
   });
   assert.ok(s1);
 
-  // 2. reconciler 式重复补挂（同间隔）：必须 alreadyOn 且不再 ping
-  const r2 = await onKey(keyI, 50);
+  // 2. reconciler 式重复补挂（ensure + 同窗口）：必须 alreadyOn 且不再 ping
+  //    （2026-10-25 起：用户显式 ON(resume) 永远全量重置+立即探测，幂等短路仅对 ensure 生效）
+  const r2 = await onKey(keyI, 50, 'ensure');
   assert.equal(r2.status, 200);
-  assert.equal(r2.json.alreadyOn, true, '同状态重复 /control/on 应幂等短路');
+  assert.equal(r2.json.alreadyOn, true, 'ensure 同状态补挂应幂等短路');
   assert.equal(r2.json.immediatePing, false);
   await new Promise((r) => setTimeout(r, 100));
   const s2 = await pingStateOf(keyI);
   assert.equal(s2.pingCount, s1.pingCount, '重复补挂不得触发新的 ping');
 
-  // 3. 制造 429 失败进入 retry，然后重复 /control/on：retry 状态不得被清空
+  // 3. 429（engine 超负荷）后 ensure 补挂：不得重置锚点/清空突发、不得自动关闭
   responder = () => ({ status: 429, json: { error: { type: 'rate_limit' } } });
   sidecar.runPing(keyI);
   const sRetry = await waitFor(async () => {
     const p = await pingStateOf(keyI);
-    return p && p.health === 'retrying' && p.retryCount === 1 ? p : null;
+    return p && p.health === 'retrying' ? p : null;
   });
-  assert.ok(sRetry, '429 后应 retrying #1');
-  const r3 = await onKey(keyI, 50);
+  assert.ok(sRetry, '429 后应 retrying');
+  const rawBefore = sidecar.pings.get(keyI);
+  const anchorBefore = rawBefore.anchorMs;
+  const r3 = await onKey(keyI, 50, 'ensure');
   assert.equal(r3.json.alreadyOn, true);
   const raw = sidecar.pings.get(keyI);
-  assert.equal(raw.retryCount, 1, '重复补挂不得重置 retryCount');
-  assert.ok(raw.retryTimer, '重复补挂不得清空 pending retryTimer');
+  assert.equal(raw.anchorMs, anchorBefore, '重复补挂不得重置锚点');
+  assert.equal(raw.consecutiveTransportFailures, 1, '失败计数不得被重置');
   assert.equal(raw.health, 'retrying');
+  assert.equal(raw.on, true, '429 不得自动关闭');
 
-  // 4. 上游恢复：被保留的 retry 定时器应照常触发并恢复 hit
+  // 4. 上游恢复：突发窗口内自动重试并恢复 hit
   responder = () => ({ status: 200, json: { id: 'm', usage: { input_tokens: 100, cache_read_input_tokens: 95, cache_creation_input_tokens: 0, output_tokens: 16 } } });
+  raw.anchorMs = Date.now() - 1000;
+  sidecar.startBurst(keyI);
   const sHit = await waitFor(async () => {
     const p = await pingStateOf(keyI);
-    return p && p.health === 'hit' && p.retryCount === 0 ? p : null;
-  });
-  assert.ok(sHit, 'retry 定时器应存活并恢复 hit（生产事故前会被每分钟清空）');
+    return p && p.health === 'hit' ? p : null;
+  }, 8000);
+  assert.ok(sHit, '突发重试应恢复 hit');
 
-  // 5. 间隔变更不算幂等：应走完整重置 + immediate ping
+  // 5. 窗口变更不算幂等：应走完整重置 + immediate ping
   const before = (await pingStateOf(keyI)).pingCount;
-  const r5 = await onKey(keyI, 30);
-  assert.equal(r5.json.immediatePing, true, '间隔变化是真实变更，不短路');
+  const r5 = await onKey(keyI, 30, 'ensure');
+  assert.equal(r5.json.immediatePing, true, '窗口变化是真实变更，不短路');
   await waitFor(async () => {
     const p = await pingStateOf(keyI);
     return p && p.pingCount > before ? p : null;
@@ -948,7 +964,7 @@ test('2026-10-20: 401/403 立即急停（凭据/配额问题重试无意义）',
   const port = sidecar.server.address().port;
   const saved = { ...sidecar.config };
   sidecar.config.recencyWindowMs = 0;
-  sidecar.config.retryDelaysMs = [10000, 20000]; // 长 retry，确保是急停而非 retry
+  sidecar.config.burstIntervalMs = 10000; // 长步进，确保测的是急停而非突发重试
   t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
 
   const req = (path, body) => new Promise((resolve) => {
@@ -1120,7 +1136,7 @@ test('2026-10-21: 单次命中墙是唯一的自动关闭判据（transport 失�
   const port = sidecar.server.address().port;
   const saved = { ...sidecar.config };
   sidecar.config.recencyWindowMs = 0;
-  sidecar.config.retryDelaysMs = [20, 40];
+  sidecar.config.burstIntervalMs = 20;
   t.after(() => { Object.assign(sidecar.config, saved); mockUpstream.close(); sidecar.server.close(); });
 
   const post = (path, obj) => new Promise((resolve) => {
@@ -1267,6 +1283,9 @@ test('2026-10-21 KI-2 完整闭环: 重启后自动恢复 ping 循环（不依�
     assert.ok(p, 'pings 应恢复该 key');
     assert.equal(p.on, true);
     assert.equal(p.intervalMin, 25);
+    // 2026-10-25 窗口迁移：旧 intervalMin=25 → [max(1,25-10), 25] = 15-25
+    assert.equal(p.windowStartMin, 15, '旧 intervalMin 应迁移为窗口左端 N-10');
+    assert.equal(p.windowEndMin, 25, '旧 intervalMin 应迁移为窗口右端 N');
     assert.equal(p.pingCount, 3, '累计计数应延续');
     assert.equal(p.waitingForRequest, false, '有请求体时不应是 waiting');
     assert.ok(sidecar.pingTimers.has(key), '必须重建定时器（否则仍要等插件补挂）');
@@ -1951,4 +1970,101 @@ test('tool-gate: 端到端——出站剥除、录制体==出站体（ping 重�
   assert.equal(r2.status, 200);
   const up2 = JSON.parse(lastUpstreamBody);
   assert.equal(up2.tools.length, 2, '关闭后工具原样透传');
+});
+
+// ── 区间突发引擎（2026-10-25）──────────────────────────────────────────────
+test('window-burst: 窗口右端耗尽后停止尝试（window-expired），本周期不再发 ping', async (t) => {
+  let upstreamPings = 0;
+  const mockUpstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      upstreamPings++;
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'rate_limit', message: 'engine overloaded' } }));
+    });
+  });
+  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const port = sidecar.server.address().port;
+  const saved = { ...sidecar.config };
+  sidecar.config.burstIntervalMs = 40;
+  t.after(() => {
+    Object.assign(sidecar.config, saved);
+    mockUpstream.close();
+    sidecar.server.close();
+  });
+
+  const post = (path, obj) => new Promise((resolve) => {
+    const req = http.request(
+      { hostname: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
+      (res) => { const c = []; res.on('data', (x) => c.push(x)); res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(c).toString('utf8'))) })); }
+    );
+    req.end(JSON.stringify(obj));
+  });
+  const stateOf = async (key) => (await (await fetch(`http://127.0.0.1:${port}/control/state`)).json()).pings.find((x) => x.key === key) || null;
+
+  const key = 'dshsc-windowexpire01';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3.1-pro', system: 'S-we', messages: [{ role: 'user', content: 'x' }] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3.1-pro', lastSeenMs: Date.now(),
+  });
+  // 窗口 0.1-0.4 分钟（6s-24s），锚点=现在；burst 步进 40ms
+  const on = await post('/control/on', { key, windowStartMin: 0.1, windowEndMin: 0.4 });
+  assert.equal(on.status, 200);
+
+  // 等窗口耗尽（immediate probe + 6s 后突发到 24s；上限 ~26s）
+  const t0 = Date.now();
+  let st = null;
+  while (Date.now() - t0 < 30000) {
+    st = await stateOf(key);
+    if (st && st.health === 'window-expired') break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.ok(st, '状态应可见');
+  assert.equal(st.health, 'window-expired', '窗口耗尽应显式标记');
+  assert.equal(st.on, true, '窗口耗尽不自动关闭（429 是临时错误）');
+  assert.ok(st.burst.attempts >= 3, `突发内应多次尝试（实际 ${st.burst.attempts}）`);
+  const pingsAtExpiry = upstreamPings;
+
+  // 耗尽后不再有新尝试（下一窗口在 0.1min≈6s 后才开——观察 3s 内计数不变）
+  await new Promise((r) => setTimeout(r, 3000));
+  assert.equal(upstreamPings, pingsAtExpiry, '窗口右端之后不得再尝试');
+  sidecar.clearPingTimers(key);
+  sidecar.pings.delete(key);
+  sidecar.recordedRequests.delete(key);
+});
+
+test('window-burst: /control/on 窗口参数校验（invalid-window / 旧 intervalMin 映射）', async (t) => {
+  await new Promise((r) => sidecar.server.listen(0, '127.0.0.1', r));
+  const port = sidecar.server.address().port;
+  t.after(() => sidecar.server.close());
+  const post = (path, obj) => new Promise((resolve) => {
+    const req = http.request(
+      { hostname: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
+      (res) => { const c = []; res.on('data', (x) => c.push(x)); res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(c).toString('utf8'))) })); }
+    );
+    req.end(JSON.stringify(obj));
+  });
+
+  const key = 'dshsc-windowparam01';
+  sidecar.recordedRequests.set(key, {
+    body: Buffer.from(JSON.stringify({ model: 'k3', system: 'S', messages: [] })),
+    path: '/v1/chat/completions', headers: {}, model: 'k3', lastSeenMs: Date.now(),
+  });
+  // 起止倒挂 → 400
+  const bad = await post('/control/on', { key, windowStartMin: 30, windowEndMin: 20 });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.json.error, 'invalid-window');
+  // 旧 intervalMin 40 → 窗口 30-40
+  const ok = await post('/control/on', { key, intervalMin: 40 });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.state.windowStartMin, 30, '旧 intervalMin=N 应映射 [N-10, N]');
+  assert.equal(ok.json.state.windowEndMin, 40);
+  sidecar.clearPingTimers(key);
+  sidecar.pings.delete(key);
+  sidecar.recordedRequests.delete(key);
 });

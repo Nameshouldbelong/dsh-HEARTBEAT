@@ -350,7 +350,7 @@ function persistPings() {
         on: p.on === true,
         windowStartMin: p.windowStartMin,
         windowEndMin: p.windowEndMin,
-        intervalMin: p.windowEndMin, // 兼容旧读取方
+        intervalMin: p.windowEndMin ?? p.intervalMin, // 兼容旧读取方
         anchorMs: p.anchorMs || null,
         pingCount: p.pingCount || 0,
         lastPingAt: p.lastPingAt || null,
@@ -1536,11 +1536,13 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // 幂等短路（2026-10-20 生产事故修复）：reconciler 周期对所有 on 会话补挂
-      // /control/on。已健康运行的 key（on + 同窗口 + 窗口定时器在 + 非 stale/
-      // waiting）一律视为 no-op，直接返回现状——绝不重置锚点/突发。
+      // 幂等短路（2026-10-20 生产事故修复 + 2026-10-25 收紧）：
+      // **只对 action='ensure'（reconciler 对账）生效** —— 同窗口 + 定时器在 +
+      // 非 stale/waiting 时视为 no-op，绝不白 ping / 不动锚点。
+      // 用户显式 ON（resume）不走此短路：必须全量重置并立即探测一次
+      // （"我点了 ON 就该马上有反馈"，且这是显式重开低命中熔断的唯一入口）。
       const cur = pings.get(key);
-      if (cur && cur.on
+      if (action === 'ensure' && cur && cur.on
           && cur.windowStartMin === windowStartMin && cur.windowEndMin === windowEndMin
           && (pingTimers.has(key) || burstTimers.has(key) || (cur.burst && cur.burst.startedAt))
           && !cur.stale && !cur.waitingForRequest) {
