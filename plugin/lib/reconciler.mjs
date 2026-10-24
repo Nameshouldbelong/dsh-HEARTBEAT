@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { readState, removeSessionState, updateSessionState } from './state.mjs';
 import { sidecarControlOn, sidecarControlOff } from './sidecar-client.mjs';
-import { resolveSessionKey, verifyBinding } from './commands.mjs';
+import { resolveSessionKey, verifyBinding, windowOfSession } from './commands.mjs';
 
 function extractSessionInfo(record) {
   if (!record || typeof record !== 'object') return null;
@@ -312,7 +312,8 @@ export async function runReconciliation({ ctx, statePath, activeSessionIds, acti
           // 2026-10-23 审计 T20：no-request-recorded 时必须**把等待意图注册到
           // sidecar**，否则 sidecar 不知道有人想保温，真实请求到达也不会开循环。
           if (check.reason === 'no-request-recorded') {
-            try { await sidecarControlOn(derivedKey, session.intervalMin || 30, 'resume'); } catch {}
+            const rw = windowOfSession(session);
+            try { await sidecarControlOn(derivedKey, rw.startMin, rw.endMin, 'resume'); } catch {}
           }
           updateSessionState(statePath, sessionId, {
             waiting: check.reason === 'no-request-recorded',
@@ -321,7 +322,8 @@ export async function runReconciliation({ ctx, statePath, activeSessionIds, acti
           reconciled.waiting.push(sessionId);
           continue;
         }
-        const res = await sidecarControlOn(derivedKey, session.intervalMin || 30, 'ensure');
+        const ew = windowOfSession(session);
+        const res = await sidecarControlOn(derivedKey, ew.startMin, ew.endMin, 'ensure');
         const waiting = res != null && res.status === 409;
 
         // 2026-10-22 第二轮审计修复（问题 1）：**必须核对 sidecar 的真实状态**。

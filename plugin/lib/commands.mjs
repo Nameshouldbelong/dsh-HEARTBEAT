@@ -10,24 +10,39 @@ import {
 import { sessionKeyFor } from './keys.mjs';
 
 export function parseHtoParam(input) {
-  const usage = '用法：/HTO <分钟>（1-720），如 /HTO 60';
-  if (typeof input !== 'string') {
-    return { valid: false, error: usage };
+  // 2026-10-25 区间突发版：参数是保温窗口。
+  //   空            → 默认 20-30
+  //   "20-30"       → 窗口 [20,30]（含端点，30min 整之后不再尝试）
+  //   "30"          → 旧单值兼容 → [max(1,30-10), 30] = 20-30
+  const usage = '用法：/HTON [起-止]（分钟，1-720，如 20-30；不带参数默认 20-30）';
+  const DEFAULT_START = 20;
+  const DEFAULT_END = 30;
+  if (typeof input !== 'string' || !input.trim()) {
+    return { valid: true, startMin: DEFAULT_START, endMin: DEFAULT_END };
   }
   const trimmed = input.trim();
-  if (!trimmed) {
+  const range = trimmed.match(/^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$/);
+  if (range) {
+    const s = Number(range[1]);
+    const e = Number(range[2]);
+    if (Number.isFinite(s) && Number.isFinite(e) && s >= 1 && e <= 720 && s < e
+        && Number.isSafeInteger(s) && Number.isSafeInteger(e)) {
+      return { valid: true, startMin: s, endMin: e };
+    }
     return { valid: false, error: usage };
   }
-  // 必须是纯整数字符串，不可包含小数点、非数字字符或多余分词
-  if (!/^\d+$/.test(trimmed)) {
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (Number.isSafeInteger(n) && n >= 11 && n <= 720) {
+      return { valid: true, startMin: Math.max(1, n - 10), endMin: n };
+    }
     return { valid: false, error: usage };
   }
-  const num = Number(trimmed);
-  if (!Number.isSafeInteger(num) || num < 1 || num > 720) {
-    return { valid: false, error: usage };
-  }
-  return { valid: true, minutes: num };
+  return { valid: false, error: usage };
 }
+
+// 兼容别名（旧引用）
+const parseHbWindowParam = parseHtoParam;
 
 // 2026-10-21 v2：key 不再「解析」而是「推导」。
 // 旧实现 resolveSessionKey 有两处致命缺陷，已全部删除：
@@ -105,10 +120,24 @@ async function resolveExpectedPromptTokens(sessionId, key, provided) {
   return null;
 }
 
+/** 取会话的保温窗口：优先 windowStartMin/windowEndMin，旧 intervalMin 映射 [N-10,N]，缺省 20-30 */
+export function windowOfSession(session) {
+  if (session && Number.isFinite(Number(session.windowStartMin)) && Number.isFinite(Number(session.windowEndMin))) {
+    return { startMin: Number(session.windowStartMin), endMin: Number(session.windowEndMin) };
+  }
+  if (session && Number.isFinite(Number(session.intervalMin)) && session.intervalMin >= 11) {
+    return { startMin: Math.max(1, Number(session.intervalMin) - 10), endMin: Number(session.intervalMin) };
+  }
+  return { startMin: 20, endMin: 30 };
+}
+
 export async function executeHton(sessionId, statePath, opts = {}) {
   const state = readState(statePath);
   const current = state.sessions[sessionId];
-  const intervalMin = current?.intervalMin || 30;
+  const fallback = windowOfSession(current);
+  const parsed = parseHtoParam(opts.windowArg);
+  const win = parsed.valid ? parsed : fallback;
+  const { startMin, endMin } = win;
   const key = resolveSessionKey(sessionId);
 
   const expected = await resolveExpectedPromptTokens(sessionId, key, opts.expectedPromptTokens);
@@ -117,13 +146,15 @@ export async function executeHton(sessionId, statePath, opts = {}) {
     // 2026-10-23 审计 T20：还没有请求体时，**必须把等待意图注册到 sidecar**，
     // 而不是只在本地 state 里写个 waiting 字样。否则 sidecar 不知道有人想保温，
     // 下一条真实请求到达也不会自动开循环 —— 用户以为开着，实际永远等不到。
-    const res = await sidecarControlOn(key, intervalMin, 'resume').catch(() => null);
+    const res = await sidecarControlOn(key, startMin, endMin, 'resume').catch(() => null);
     const waiting = res != null && res.status === 409;
-    updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting });
+    updateSessionState(statePath, sessionId, {
+      key, on: true, windowStartMin: startMin, windowEndMin: endMin, intervalMin: endMin, waiting,
+    });
     if (res == null) {
       return `⚠️ sidecar 未响应（已记录开启意图，reconciler 会补挂）`;
     }
-    return `⏳ 已登记等待：该会话下一次真实请求到达后自动开始保温（间隔 ${intervalMin}min）`;
+    return `⏳ 已登记等待：该会话下一次真实请求到达后自动开始保温（窗口 ${startMin}-${endMin}min）`;
   }
   if (!check.ok) {
     // 真打错对象：校验失败不写 on:true —— 状态必须与事实一致
@@ -131,13 +162,16 @@ export async function executeHton(sessionId, statePath, opts = {}) {
     return check.text;
   }
 
-  const res = await sidecarControlOn(key, intervalMin).catch(() => null);
-  updateSessionState(statePath, sessionId, { key, on: true, intervalMin, waiting: res != null && res.status === 409 });
+  const res = await sidecarControlOn(key, startMin, endMin).catch(() => null);
+  updateSessionState(statePath, sessionId, {
+    key, on: true, windowStartMin: startMin, windowEndMin: endMin, intervalMin: endMin,
+    waiting: res != null && res.status === 409,
+  });
 
   if (!res || res.status !== 200) {
-    return `⚠️ sidecar 未响应（已记录开启意图，reconciler 定期自动补挂，间隔 ${intervalMin}min）`;
+    return `⚠️ sidecar 未响应（已记录开启意图，reconciler 定期自动补挂，窗口 ${startMin}-${endMin}min）`;
   }
-  return `💓 心跳已开启（间隔 ${intervalMin}min，前缀 ${check.result?.actualPromptTokens ?? '?'} token），已立即执行首次保温`;
+  return `💓 心跳已开启（窗口 ${startMin}-${endMin}min，窗口内每 5s 突发至成功，前缀 ${check.result?.actualPromptTokens ?? '?'} token），已立即执行首次探测`;
 }
 
 export async function executeHtoff(sessionId, statePath) {
@@ -177,7 +211,7 @@ export async function executeHto(arg, sessionId, statePath, opts = {}) {
     return parsed.error;
   }
 
-  const intervalMin = parsed.minutes;
+  const { startMin, endMin } = parsed;
   const key = resolveSessionKey(sessionId);
 
   const expected = await resolveExpectedPromptTokens(sessionId, key, opts.expectedPromptTokens);
@@ -187,23 +221,25 @@ export async function executeHto(arg, sessionId, statePath, opts = {}) {
     return check.text;
   }
 
-  const res = await sidecarControlOn(key, intervalMin).catch(() => null);
+  const res = await sidecarControlOn(key, startMin, endMin).catch(() => null);
   updateSessionState(statePath, sessionId, {
     key,
     on: true,
-    intervalMin,
+    windowStartMin: startMin,
+    windowEndMin: endMin,
+    intervalMin: endMin,
     waiting: res != null && res.status === 409,
   });
 
   let receipt;
   if (!res || res.status !== 200) {
-    receipt = `⚠️ sidecar 未响应（已记录开启意图，reconciler 定期自动补挂，间隔 ${intervalMin}min）`;
+    receipt = `⚠️ sidecar 未响应（已记录开启意图，reconciler 定期自动补挂，窗口 ${startMin}-${endMin}min）`;
   } else {
-    receipt = `💓 心跳间隔已设为 ${intervalMin}min 并开启（前缀 ${check.result?.actualPromptTokens ?? '?'} token），已立即执行首次保温`;
+    receipt = `💓 心跳窗口已设为 ${startMin}-${endMin}min 并开启（窗口内每 5s 突发至成功，前缀 ${check.result?.actualPromptTokens ?? '?'} token），已立即执行首次探测`;
   }
 
-  if (intervalMin >= 40) {
-    receipt += '\n⚠️ 间隔≥40min：实测缓存存活约 28–45min，可能来不及续期';
+  if (endMin >= 40) {
+    receipt += `\n⚠️ 窗口右端≥40min：实测缓存存活约 28–45min，可能来不及续期`;
   }
   return receipt;
 }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-heartbeat",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Session-level LLM prefix-cache keep-alive + kimi-bound tool gate for DSH: HEARTBEAT/TOOL GATE tabs, TG duty commands (/HTON /HTOFF /HTO /TGON /TGOFF /TG)",
   "type": "module",
   "main": "lib/index.mjs",

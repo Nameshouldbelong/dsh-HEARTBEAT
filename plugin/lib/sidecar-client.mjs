@@ -76,18 +76,26 @@ export async function sidecarSelfCheck() {
 }
 
 /**
- * 开启保温（2026-10-23 审计第一批第 1 条：ensure / resume 分离）。
+ * 开启保温（2026-10-25 区间突发版：窗口 [startMin, endMin]，窗口内每 5s 突发至成功）。
  *
  * @param {'ensure'|'resume'} action
  *   'resume' = 用户显式开启，可解除可恢复熔断（低命中 / 403）。
  *   'ensure' = 自动对账补挂，**不得**解除熔断；熔断中返回 409 breaker-open。
- * 旧调用方不传 action 时按 'resume' 处理（保持向后兼容）。
+ * 旧调用方不传窗口时默认 20-30；旧调用方传 intervalMin 数字时映射为 [N-10, N]。
  */
-export async function sidecarControlOn(key, intervalMin = 30, action = 'resume') {
+export async function sidecarControlOn(key, windowStartMin = 20, windowEndMin = 30, action = 'resume') {
+  const payload = { key, action };
+  if (typeof windowStartMin === 'number' && typeof windowEndMin === 'number') {
+    payload.windowStartMin = windowStartMin;
+    payload.windowEndMin = windowEndMin;
+  } else if (typeof windowStartMin === 'number') {
+    payload.intervalMin = windowStartMin; // 兼容旧签名 (key, intervalMin, action)
+    if (typeof windowEndMin === 'string') payload.action = windowEndMin;
+  }
   return sidecarRequest('/control/on', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ key, intervalMin, action }),
+    body: JSON.stringify(payload),
   });
 }
 

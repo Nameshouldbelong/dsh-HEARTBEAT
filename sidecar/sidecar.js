@@ -348,7 +348,10 @@ function persistPings() {
       merged[key] = {
         key,
         on: p.on === true,
-        intervalMin: p.intervalMin,
+        windowStartMin: p.windowStartMin,
+        windowEndMin: p.windowEndMin,
+        intervalMin: p.windowEndMin, // 兼容旧读取方
+        anchorMs: p.anchorMs || null,
         pingCount: p.pingCount || 0,
         lastPingAt: p.lastPingAt || null,
         spentUsd: p.spentUsd || 0,
@@ -559,7 +562,9 @@ function runSelfCheck() {
   for (const [key, p] of pings.entries()) {
     if (!p || !p.on) continue;  // 只检查"声称开着"的
     const rec = recordedRequests.get(key);
-    const hasTimer = pingTimers.has(key);
+    // 窗口定时器（pingTimers）在窗口开启时移交给突发链（burstTimers）——
+    // 突发进行中任一存在都算"循环在"
+    const hasTimer = pingTimers.has(key) || burstTimers.has(key) || !!(p && p.burst);
     const s = sessions.get(key);
 
     if (!rec) {
@@ -650,10 +655,17 @@ function loadPersistedPings() {
       // ensure 以 full-reset 重新开 ping，违背"熔断必须可持久"的设计承诺）。
       if (!v.on) {
         if (!v.autoOffedAt) continue;   // 用户显式 OFF：不是熔断，无需恢复
+        const bw = normalizeWindow(
+          v.windowStartMin ?? Math.max(1, (v.intervalMin || 30) - 10),
+          v.windowEndMin ?? (v.intervalMin || 30));
         pings.set(key, {
           key,
           on: false,
+          windowStartMin: bw ? bw.startMin : config.windowDefaultStartMin,
+          windowEndMin: bw ? bw.endMin : config.windowDefaultEndMin,
           intervalMin: v.intervalMin || 30,
+          anchorMs: null,
+          burst: null,
           lastPingAt: v.lastPingAt || null,
           pingCount: v.pingCount || 0,
           stale: true,
@@ -661,8 +673,6 @@ function loadPersistedPings() {
           waitingForRequest: false,
           lastUsage: null,
           lastError: null,
-          retryCount: 0,
-          retryTimer: null,
           consecutiveZeroCacheRead: v.consecutiveZeroCacheRead || 0,
           consecutiveTransportFailures: 0,
           spentUsd: v.spentUsd || 0,
@@ -673,10 +683,24 @@ function loadPersistedPings() {
         continue;
       }
       const hasBody = recordedRequests.has(key);
+      const bw = normalizeWindow(
+        v.windowStartMin ?? Math.max(1, (v.intervalMin || 30) - 10),
+        v.windowEndMin ?? (v.intervalMin || 30));
+      const wStart = bw ? bw.startMin : config.windowDefaultStartMin;
+      const wEnd = bw ? bw.endMin : config.windowDefaultEndMin;
+      // 锚点：录制体新鲜（窗口右端内）则沿用，否则从现在起算
+      const recBody = recordedRequests.get(key);
+      const anchorMs = hasBody && recBody && (Date.now() - recBody.lastSeenMs) < wEnd * 60000
+        ? recBody.lastSeenMs
+        : Date.now();
       pings.set(key, {
         key,
         on: true,
+        windowStartMin: wStart,
+        windowEndMin: wEnd,
         intervalMin: v.intervalMin || 30,
+        anchorMs,
+        burst: null,
         lastPingAt: v.lastPingAt || null,
         pingCount: v.pingCount || 0,
         stale: false,
@@ -684,8 +708,6 @@ function loadPersistedPings() {
         waitingForRequest: !hasBody,
         lastUsage: null,
         lastError: null,
-        retryCount: 0,
-        retryTimer: null,
         consecutiveZeroCacheRead: v.consecutiveZeroCacheRead || 0,
         consecutiveTransportFailures: 0,
         spentUsd: v.spentUsd || 0,
@@ -693,9 +715,7 @@ function loadPersistedPings() {
         blockedReason: v.blockedReason || null,
       });
       if (hasBody) {
-        const timer = setInterval(() => runPing(key), (v.intervalMin || 30) * 60 * 1000);
-        if (timer.unref) timer.unref();
-        pingTimers.set(key, timer);
+        scheduleWindow(key);
         restored++;
       } else {
         waiting++;
@@ -711,9 +731,16 @@ function loadPersistedPings() {
 // 可测试配置（测试可直接改写字段注入短计时）
 const config = {
   pingTimeoutMs: parseInt(process.env.PING_TIMEOUT_MS || '120000', 10), // ping 上游超时（原实现无超时，卡死会静默）
-  retryDelaysMs: [2 * 60 * 1000, 4 * 60 * 1000], // 临时错误快速抢救：+2min / +4min，不动主 interval
-  recencyWindowMs: 10000, // 真实请求 <10s 内
-  recencyDeferMs: 30000,  // 重放顺延 30s
+  // ── 区间突发引擎（2026-10-25 用户裁定：删除"单时点+3 次重试"）────────────
+  // 每个保温周期的锚点（anchor）= 最近一次缓存确认触碰（真实请求或命中 ping）。
+  // 锚点后第 windowStartMin 分钟进入突发窗口：每 burstIntervalMs 发一次 HB，
+  // 直到保温成功（hit）或窗口右端（windowEndMin）耗尽；窗口耗尽本周期不再尝试。
+  // 429（engine 超负荷）/5xx/网络错误在窗口内自动被 5s 节奏重试——
+  // 不再有独立的 retry 计数/延时（scheduleRetry 已删除）。
+  burstIntervalMs: parseInt(process.env.BURST_INTERVAL_MS || '5000', 10),
+  windowDefaultStartMin: parseInt(process.env.HB_WINDOW_START_MIN || '20', 10),
+  windowDefaultEndMin: parseInt(process.env.HB_WINDOW_END_MIN || '30', 10),
+  recencyWindowMs: 10000, // 真实请求 <10s 内（保留给 waiting 恢复的立即探测防贴脸）
   // 2026-10-20：命中率门槛（低门槛，用户要求"不应太高"）。
   // cached/prompt >= hitRatioMin 才算 hit；低于门槛视为失败计数。
   hitRatioMin: parseFloat(process.env.HIT_RATIO_MIN || '0.05'),
@@ -834,28 +861,121 @@ function classifyPingResult(statusCode, usage, hitRatioMin) {
 
 // 临时错误快速 retry：retry #1 +2min、retry #2 +4min(默认值见 config.retryDelaysMs)。
 // 用独立 setTimeout, 主 setInterval 周期不漂移; 成功即清零; 耗尽则置 stale 等真实流量复活。
-function scheduleRetry(key) {
-  const pingState = pings.get(key);
-  if (!pingState || !pingState.on) return;
-  const retry = (pingState.retryCount || 0) + 1;
-  if (retry > config.retryDelaysMs.length) {
-    pingState.retryCount = 0;
-    pingState.health = 'stale';
-    pingState.stale = true;
-    console.log(`[ping] key=${key} retries exhausted, marked stale`);
+// ── 区间突发引擎（2026-10-25，替换上面的单时点+重试模型）──────────────────
+// 事件流：anchor（缓存确认触碰）→ [windowStartMin] 进入突发 → 每 5s 一次 HB
+//   → hit：结束本周期，anchor=now，预约下一窗口
+//   → 429/5xx/网络/超时/unknown：继续 5s 节奏（窗口内）
+//   → recreated/no-cache：命中墙熔断（唯一自动关闭判据，不变）
+//   → 401/403：凭据级硬错，立即 off（不变）
+//   → 400：本周期停止突发（请求体级问题，5s 重锤无意义），等下一窗口
+//   → 窗口右端耗尽：health=window-expired，本周期不再尝试，anchor=now 预约下一窗口
+const burstTimers = new Map(); // key -> Timeout（突发链的 5s 步进定时器）
+
+function clearPingTimers(key) {
+  if (pingTimers.has(key)) { clearTimeout(pingTimers.get(key)); pingTimers.delete(key); }
+  if (burstTimers.has(key)) { clearTimeout(burstTimers.get(key)); burstTimers.delete(key); }
+}
+
+/** 校验/归一化保温窗口。合法：0.05 ≤ start < end ≤ 720（业务上取整数分钟）。 */
+function normalizeWindow(startMin, endMin) {
+  const s = Number(startMin);
+  const e = Number(endMin);
+  if (!Number.isFinite(s) || !Number.isFinite(e)) return null;
+  if (s < 0.05 || e > 720 || s >= e) return null;
+  return { startMin: s, endMin: e };
+}
+
+/** 预约下一个突发窗口：anchor + windowStartMin（已过时则立即触发）。 */
+function scheduleWindow(key) {
+  const st = pings.get(key);
+  if (!st || st.on !== true || st.stale) return;
+  if (!recordedRequests.has(key)) {
+    st.waitingForRequest = true;
+    st.health = st.health || 'waiting';
     return;
   }
-  pingState.retryCount = retry;
-  pingState.health = 'retrying';
-  const delayMs = config.retryDelaysMs[retry - 1];
-  if (pingState.retryTimer) clearTimeout(pingState.retryTimer);
-  const t = setTimeout(() => {
-    pingState.retryTimer = null;
-    runPing(key);
-  }, delayMs);
+  if (pingTimers.has(key)) { clearTimeout(pingTimers.get(key)); pingTimers.delete(key); }
+  const anchor = st.anchorMs || Date.now();
+  const delay = Math.max(0, anchor + st.windowStartMin * 60000 - Date.now());
+  const t = setTimeout(() => { pingTimers.delete(key); startBurst(key); }, delay);
   if (t.unref) t.unref();
-  pingState.retryTimer = t;
-  console.log(`[ping] key=${key} transport/API failure, retry #${retry} in ${Math.round(delayMs / 1000)}s`);
+  pingTimers.set(key, t);
+}
+
+/** 进入突发窗口。deadline = anchor + windowEndMin。 */
+function startBurst(key) {
+  const st = pings.get(key);
+  if (!st || st.on !== true || st.stale) return;
+  if (!recordedRequests.has(key)) {
+    st.waitingForRequest = true;
+    st.health = 'waiting';
+    return;
+  }
+  st.burst = {
+    startedAt: Date.now(),
+    attempts: 0,
+    deadlineMs: (st.anchorMs || Date.now()) + st.windowEndMin * 60000,
+  };
+  if (st.health !== 'hit') st.health = 'bursting';
+  console.log(`[ping] key=${key} burst window open (deadline in ${Math.max(0, Math.round((st.burst.deadlineMs - Date.now()) / 1000))}s)`);
+  burstStep(key);
+}
+
+/** 突发步进：窗口耗尽则收尾，否则发一次尝试；完成后的续链由 afterAttempt 负责。 */
+function burstStep(key) {
+  const st = pings.get(key);
+  if (!st || st.on !== true || !st.burst) return;
+  if (Date.now() >= st.burst.deadlineMs) {
+    st.health = 'window-expired';
+    if (!st.lastError) st.lastError = 'window-expired';
+    st.burst = null;
+    st.anchorMs = Date.now();   // 下一周期从窗口耗尽时刻重新起算
+    clearPingTimers(key);
+    console.log(`[ping] key=${key} window expired without success; next window in ${st.windowStartMin}min`);
+    persistPings();
+    scheduleWindow(key);
+    return;
+  }
+  attemptPing(key);
+}
+
+/**
+ * 每次尝试结束后的统一处置（attemptPing 的结果回调）。
+ * outcome: 'hit'|'recreated'|'no-cache'|'unknown'|'continue'|'stop'
+ *   · hit      → anchor=now，结束突发，预约下一窗口
+ *   · continue → 429/5xx/网络/超时/unknown：仍在窗口内则 5s 后再试
+ *   · stop     → 400/致命错误：本周期停止（熔断/关闭路径已自行处理）
+ */
+function afterAttempt(key, outcome) {
+  const st = pings.get(key);
+  if (!st || !st.burst) return;
+  if (outcome === 'hit') {
+    st.burst = null;
+    st.anchorMs = Date.now();
+    clearPingTimers(key);
+    scheduleWindow(key);
+    return;
+  }
+  if (outcome === 'continue') {
+    if (burstTimers.has(key)) { clearTimeout(burstTimers.get(key)); }
+    const t = setTimeout(() => burstStep(key), config.burstIntervalMs);
+    if (t.unref) t.unref();
+    burstTimers.set(key, t);
+    return;
+  }
+  // stop / recreated / no-cache：突发不再继续（熔断路径已清 timer）
+  st.burst = null;
+  if (outcome === 'stop') {
+    st.anchorMs = Date.now();
+    clearPingTimers(key);
+    scheduleWindow(key);
+  }
+}
+
+function scheduleRetry(key) {
+  // 已删除（2026-10-25）：单时点+3 次重试模型被区间突发引擎取代。
+  // 保留空壳仅为了旧日志/旧测试的可读性；不应再被调用。
+  console.log('[ping] scheduleRetry is deprecated (window burst engine in effect)');
 }
 
 /**
@@ -876,35 +996,21 @@ function releaseInFlight(key) {
   }
 }
 
-function runPing(key) {
+function attemptPing(key) {
   const pingState = pings.get(key);
   if (!pingState || !pingState.on || pingState.stale) return;
   const rec = recordedRequests.get(key);
   if (!rec) return;
 
-  // 单在途锁（2026-10-22 审计修复，codex DEBUG-PLAN §5）。
-  // 旧实现下"主周期 + 快速 retry + 顺延 + 立即 ping"四条触发路径可各自
-  // 发起上游请求：审计复现了同 key 峰值 2 个并发 ping。那不只是浪费——
-  // 并发重放会让后到的响应覆盖先到的状态、互相清 retry 计数，
-  // 并放大冷读风险（一个大前缀会话同时两个全价请求）。
+  // 单在途锁（2026-10-22 审计修复）：同一 key 任意时刻至多一个在途 ping。
+  // 区间突发引擎下突发步进与在途补发共用此锁；在途期间的新调用只记意图。
   if (inFlightKeys.has(key)) {
-    // 已有在途：只记录"又有人想 ping"，等本轮结束后按需补一次，绝不并发
-    // 待补标记也存全局，避免随状态对象被替换而丢失
     pendingPingKeys.add(key);
     return;
   }
 
-  // 并发保护：该 key 的真实请求 lastSeen <10s 时本次重放顺延 30s
-  // (immediate ping / retry / 周期 ping 一律遵守)
-  const now = Date.now();
-  if (now - rec.lastSeenMs < config.recencyWindowMs) {
-    const delayTimer = setTimeout(() => runPing(key), config.recencyDeferMs);
-    if (delayTimer.unref) delayTimer.unref();
-    // 保存句柄，使 OFF 能真正取消它（旧实现泄漏 timer）
-    pingState.deferTimer = delayTimer;
-    return;
-  }
   inFlightKeys.add(key);
+  if (pingState.burst) pingState.burst.attempts = (pingState.burst.attempts || 0) + 1;
   const myGeneration = currentGeneration(key);
 
   let pingBody;
@@ -934,30 +1040,28 @@ function runPing(key) {
 
   const startMs = Date.now();
 
-  // 传输/API 失败的统一处理：不计入 cache 失败计数，走快速 retry
+  // 传输/API 失败的统一处置（区间突发版，2026-10-25）：
+  //   401/403  → 凭据级硬错，立即 off（唯一保留的立即关闭例外）
+  //   429/5xx/网络/超时 → 窗口内由 5s 节奏自动重试（不计 cache 失败）
+  //   400     → 本周期停止突发（请求体级问题，重锤无意义），等下一窗口
   const onTransportFailure = (statusCode, errStr) => {
     pingState.lastPingAt = new Date().toISOString();
     pingState.pingCount = (pingState.pingCount || 0) + 1;
     pingState.consecutiveTransportFailures = (pingState.consecutiveTransportFailures || 0) + 1;
     pingState.lastError = errStr;
 
-    // 2026-10-21 用户裁定 #2：自动关闭（on=false）的判据**只**剩"单次命中墙"。
-    // 传输类失败（429/5xx/超时）一律走快速 retry，耗尽后置 stale（暂停，on 保持 true），
-    // 下一次真实请求到达即自动复活 —— 不把偶发网络抖动误判成"该关掉保温"。
-    // 唯一例外：401/403 是凭据/配额级别的硬错误，重试与保温都不可能成功，仍立即 off。
     const fatal = statusCode === 401 || statusCode === 403;
     if (fatal) {
       pingState.stale = true;
       pingState.health = 'stale';
       pingState.on = false;
+      pingState.burst = null;
       pingState.autoOffedAt = Date.now();
       pingState.blockedReason = 'auth-error';
-      if (pingTimers.has(key)) { clearInterval(pingTimers.get(key)); pingTimers.delete(key); }
-      if (pingState.retryTimer) { clearTimeout(pingState.retryTimer); pingState.retryTimer = null; }
+      clearPingTimers(key);
       console.log(`[ping] key=${key} AUTO-OFF: fatal auth/quota error ${errStr}`);
       persistPings();
-      releaseInFlight(key);
-      return;
+      return 'off';
     }
     log({
       ts: new Date().toISOString(),
@@ -968,10 +1072,17 @@ function runPing(key) {
       model: rec.model || 'unknown',
       latency_ms: Date.now() - startMs,
       result: 'error',
-      retry: pingState.retryCount || 0,
       error: errStr,
     });
-    scheduleRetry(key);
+    if (statusCode === 400) {
+      pingState.health = 'error';
+      afterAttempt(key, 'stop');
+      return 'stop';
+    }
+    // 429（engine 超负荷）/5xx/超时/断流：窗口内继续
+    pingState.health = 'retrying';
+    afterAttempt(key, 'continue');
+    return 'continue';
   };
 
   const upReq = getUpstreamTransport().request(
@@ -985,10 +1096,7 @@ function runPing(key) {
     (upRes) => {
       const respChunks = [];
       // ── once-only finalize（2026-10-23 审计 F01）────────────────────────
-      // 旧实现只监听 'end'。响应断流（200 头 + 部分 body 后连接被关）时
-      // 'end' 永不触发 → releaseInFlight 永不调用 → 该 key 的锁永久占用，
-      // 之后所有 ping 都被"在途"挡掉，保温静默死亡。
-      // 现在 error / aborted / close 都进入同一终结器，且只执行一次。
+      // error / aborted / close 都进入同一终结器，且只执行一次；断流不再锁死 key。
       let finalized = false;
       const finalizeFailure = (why) => {
         if (finalized) return;
@@ -1015,7 +1123,6 @@ function runPing(key) {
         const result = classifyPingResult(upRes.statusCode, usage);
 
         if (result === 'error') {
-          // HTTP 429/5xx 等：transport/API 临时错误 -> retry，不算 cache miss
           onTransportFailure(upRes.statusCode, 'http-' + upRes.statusCode);
           releaseInFlight(key);
           return;
@@ -1029,7 +1136,6 @@ function runPing(key) {
           model: rec.model || 'unknown',
           latency_ms: Date.now() - startMs,
           result,
-          retry: pingState.retryCount || 0,
           usage,
         });
         console.log(`[ping] key=${key} status=${upRes.statusCode} result=${result} cache_read=${usage.cache_read_input_tokens || 0} cache_creation=${usage.cache_creation_input_tokens || 0}`);
@@ -1039,48 +1145,38 @@ function runPing(key) {
         pingState.lastError = null;
         pingState.health = result; // 'hit' | 'recreated' | 'no-cache' | 'unknown'
         pingState.consecutiveTransportFailures = 0;
-        pingState.retryCount = 0;
 
         // 估算花费仅用于展示（2026-10-21 用户裁定 #1：**不再作为关闭条件**）。
-        // 订阅制下 cache-read 在 5h 窗口内几乎不计费，按公开价目表累计总额会误杀大前缀保温。
         pingState.spentUsd = (pingState.spentUsd || 0) + estimatePingCostUsd(usage);
 
-        // 每次成功 ping 后刷新落盘（请求体可能因上下文更新；也让 updatedAt 保鲜）
         persistBodies();
         persistPings();
 
-        if (result === 'no-cache' || result === 'recreated') {
-          // 2xx 但没保住缓存：**两种都算失败**（2026-10-22 第二轮审计修复，问题 3a）。
-          // 旧实现只对 no-cache 累加、对 recreated 清零 —— 于是"有缓存写入但读数很少"
-          // （典型：前缀变了、全量重建）会被当成成功，绕过命中墙无限烧钱。
-          // 注释一直写"两者都属于没保住"，现在行为与注释一致。
+        if (result === 'hit') {
+          pingState.consecutiveZeroCacheRead = 0;
+          afterAttempt(key, 'hit');
+        } else if (result === 'no-cache' || result === 'recreated') {
+          // 唯一自动关闭判据不变：单次命中墙（failThreshold=1）。
+          // 未达阈值的 miss 也**不继续 5s 重锤**（每次 miss 都可能是全价重算），
+          // 本周期停止突发，下一窗口再试。
           pingState.consecutiveZeroCacheRead = (pingState.consecutiveZeroCacheRead || 0) + 1;
-          // 2026-10-20：单个 50min 间隔周期内只会 ping 一次，靠"连续 N 次"要等 100 分钟，
-          // 期间每次都是全价重算 —— 太慢。首次 immediate ping 就低命中即视为失败并关闭
-          // （用户要求："命中门槛不应太高，否则认为失败并关闭 ping"）。
           if (pingState.consecutiveZeroCacheRead >= config.failThreshold) {
             pingState.stale = true;
             pingState.health = 'stale';
             pingState.on = false;
-            // 熔断标记（2026-10-23）：必须可持久，供 ensure 识别、UI 展示原因
+            pingState.burst = null;
             pingState.autoOffedAt = Date.now();
             pingState.blockedReason = 'low-hit';
-            if (pingTimers.has(key)) {
-              clearInterval(pingTimers.get(key));
-              pingTimers.delete(key);
-            }
-            if (pingState.retryTimer) {
-              clearTimeout(pingState.retryTimer);
-              pingState.retryTimer = null;
-            }
+            clearPingTimers(key);
             console.log(`[ping] key=${key} AUTO-OFF: ${pingState.consecutiveZeroCacheRead} consecutive cache-miss pings (ratio < ${config.hitRatioMin}) — stopped to avoid burning quota`);
             persistPings();
+          } else {
+            afterAttempt(key, 'stop');
           }
-        } else if (result === 'hit') {
-          // 只有确认命中才清零
-          pingState.consecutiveZeroCacheRead = 0;
+        } else {
+          // unknown（无 usage 可判）：不计数、不重锤，本周期按停止处理（配额安全）
+          afterAttempt(key, 'stop');
         }
-        // result === 'unknown'：既不计失败也不清零（无信息量）
         releaseInFlight(key);
       });
     }
@@ -1097,6 +1193,9 @@ function runPing(key) {
 
   upReq.end(pingBody);
 }
+
+// 兼容别名：旧代码/旧测试引用 runPing
+const runPing = attemptPing;
 
 // ── 版本与构建自证（2026-10-22 审计 §6-d）─────────────────────────────────
 // 审计指出：部署后无法确认"源码—安装包—运行进程"是否是同一份。
@@ -1282,7 +1381,15 @@ const server = http.createServer((req, res) => {
       pings: Array.from(pings.values()).map((p) => ({
         key: p.key,
         on: p.on,
-        intervalMin: p.intervalMin,
+        windowStartMin: p.windowStartMin,
+        windowEndMin: p.windowEndMin,
+        intervalMin: p.windowEndMin,
+        anchorAt: p.anchorMs ? new Date(p.anchorMs).toISOString() : null,
+        burst: p.burst ? {
+          active: true,
+          attempts: p.burst.attempts,
+          deadlineAt: new Date(p.burst.deadlineMs).toISOString(),
+        } : { active: false, attempts: 0, deadlineAt: null },
         lastPingAt: p.lastPingAt,
         pingCount: p.pingCount,
         stale: p.stale,
@@ -1291,7 +1398,6 @@ const server = http.createServer((req, res) => {
         waitingForRequest: p.waitingForRequest === true,
         autoOffedAt: p.autoOffedAt || null,
         blockedReason: p.blockedReason || null,
-        retryCount: p.retryCount || 0,
         lastError: p.lastError || null,
         lastUsage: p.lastUsage,
       })),
@@ -1328,11 +1434,30 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'invalid-key' }));
         return;
       }
-      let intervalMin = body.intervalMin !== undefined ? Number(body.intervalMin) : 30;
-      if (!Number.isInteger(intervalMin) || intervalMin < 1 || intervalMin > 720) {
-        res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'invalid-interval' }));
-        return;
+      // 保温窗口（2026-10-25）：优先 windowStartMin/windowEndMin；
+      // 兼容旧 intervalMin（N → [N-10, N]）；缺省 20-30。
+      let windowStartMin = config.windowDefaultStartMin;
+      let windowEndMin = config.windowDefaultEndMin;
+      if (body.windowStartMin !== undefined || body.windowEndMin !== undefined) {
+        const w = normalizeWindow(
+          body.windowStartMin !== undefined ? body.windowStartMin : windowStartMin,
+          body.windowEndMin !== undefined ? body.windowEndMin : windowEndMin);
+        if (!w) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid-window', hint: 'expect 1<=start<end<=720 (minutes), e.g. 20-30' }));
+          return;
+        }
+        windowStartMin = w.startMin;
+        windowEndMin = w.endMin;
+      } else if (body.intervalMin !== undefined) {
+        const n = Number(body.intervalMin);
+        if (!Number.isInteger(n) || n < 1 || n > 720) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid-interval' }));
+          return;
+        }
+        windowEndMin = n;
+        windowStartMin = Math.max(1, n - 10);
       }
 
       // ── ensure / resume 分离（2026-10-23 审计第一批第 1 条）──────────────
@@ -1363,7 +1488,9 @@ const server = http.createServer((req, res) => {
           blockedReason: p?.blockedReason || 'auto-off',
           action,
           state: {
-            key, on: p?.on === true, intervalMin: p?.intervalMin, stale: true,
+            key, on: p?.on === true,
+            windowStartMin: p?.windowStartMin, windowEndMin: p?.windowEndMin,
+            stale: true,
             health: 'stale', pingCount: p?.pingCount || 0,
             autoOffedAt: p?.autoOffedAt || null,
           },
@@ -1378,7 +1505,11 @@ const server = http.createServer((req, res) => {
         pings.set(key, {
           key,
           on: true,
-          intervalMin,
+          windowStartMin,
+          windowEndMin,
+          intervalMin: windowEndMin, // 兼容旧读取方
+          anchorMs: null,
+          burst: null,
           lastPingAt: prev.lastPingAt || null,
           pingCount: prev.pingCount || 0,
           stale: false,
@@ -1386,8 +1517,6 @@ const server = http.createServer((req, res) => {
           waitingForRequest: true,
           lastUsage: prev.lastUsage || null,
           lastError: null,
-          retryCount: 0,
-          retryTimer: null,
           consecutiveZeroCacheRead: prev.consecutiveZeroCacheRead || 0,
           consecutiveTransportFailures: 0,
           spentUsd: prev.spentUsd || 0,
@@ -1399,20 +1528,21 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({
           error: 'no-request-recorded',
           waiting: true,
-          state: { key, on: true, intervalMin, health: 'waiting', waitingForRequest: true },
+          state: {
+            key, on: true, windowStartMin, windowEndMin,
+            health: 'waiting', waitingForRequest: true,
+          },
         }));
         return;
       }
 
-      // 幂等短路（2026-10-20 生产事故修复）：reconciler 每分钟对所有 on 会话
-      // 补挂 /control/on。旧实现每次调用都 clearInterval + 清空 retryTimer +
-      // setImmediate(runPing) —— 导致每个 on 的 key 每分钟白 ping 一次
-      // （实测 45min 内 pingCount=48，烧 cache-read quota），且 P0-2 的
-      // +2/+4min 快速 retry 定时器每分钟被清空、retryCount 归零，retry 机制
-      // 在生产实际失效。已健康运行的 key（on + 同间隔 + 定时器在 + 非 stale/
-      // waiting）一律视为 no-op，直接返回现状。
+      // 幂等短路（2026-10-20 生产事故修复）：reconciler 周期对所有 on 会话补挂
+      // /control/on。已健康运行的 key（on + 同窗口 + 窗口定时器在 + 非 stale/
+      // waiting）一律视为 no-op，直接返回现状——绝不重置锚点/突发。
       const cur = pings.get(key);
-      if (cur && cur.on && cur.intervalMin === intervalMin && pingTimers.has(key)
+      if (cur && cur.on
+          && cur.windowStartMin === windowStartMin && cur.windowEndMin === windowEndMin
+          && (pingTimers.has(key) || burstTimers.has(key) || (cur.burst && cur.burst.startedAt))
           && !cur.stale && !cur.waitingForRequest) {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
@@ -1422,7 +1552,8 @@ const server = http.createServer((req, res) => {
           state: {
             key: cur.key,
             on: cur.on,
-            intervalMin: cur.intervalMin,
+            windowStartMin: cur.windowStartMin,
+            windowEndMin: cur.windowEndMin,
             lastPingAt: cur.lastPingAt,
             pingCount: cur.pingCount,
             stale: cur.stale,
@@ -1434,24 +1565,26 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      if (pingTimers.has(key)) {
-        clearInterval(pingTimers.get(key));
-        pingTimers.delete(key);
-      }
+      clearPingTimers(key);
       const existing = pings.get(key) || {};
-      if (existing.retryTimer) {
-        clearTimeout(existing.retryTimer);
-        existing.retryTimer = null;
-      }
       // 2026-10-20：完整重置路径必须继承失败计数——旧实现每次归零，
       // 而 reconciler 每分钟补挂一次，导致"连续 N 次 miss 自动关闭"永不触发。
       // stale 状态由显式 /control/on 清除（用户主动重开），但计数保留以便继续观察。
       // resume：显式解除可恢复熔断（低命中 / 403）。清掉熔断标记。
       // ensure 在此处不会被调用（已被上面的 breaker-open 分支拦下）。
+      const rec = recordedRequests.get(key);
+      // 锚点：录制体新鲜（窗口内）则沿用其 lastSeenMs，否则从现在起算
+      const anchorMs = rec && (Date.now() - rec.lastSeenMs) < windowEndMin * 60000
+        ? rec.lastSeenMs
+        : Date.now();
       const state = {
         key,
         on: true,
-        intervalMin,
+        windowStartMin,
+        windowEndMin,
+        intervalMin: windowEndMin, // 兼容旧读取方
+        anchorMs,
+        burst: null,
         lastPingAt: existing.lastPingAt || null,
         pingCount: existing.pingCount || 0,
         stale: false,
@@ -1461,30 +1594,23 @@ const server = http.createServer((req, res) => {
         waitingForRequest: false,
         lastUsage: existing.lastUsage || null,
         lastError: null,
-        retryCount: 0,
-        retryTimer: null,
         consecutiveZeroCacheRead: existing.consecutiveZeroCacheRead || 0,
         consecutiveTransportFailures: 0,
         spentUsd: existing.spentUsd || 0,
       };
       bumpGeneration(key);   // T21：重开即新代，旧代迟到响应不得影响新代
       pings.set(key, state);
-      const timer = setInterval(() => runPing(key), intervalMin * 60 * 1000);
-      if (timer.unref) timer.unref();
-      pingTimers.set(key, timer);
+      scheduleWindow(key);
 
       // 开关状态也落盘：重启后自动恢复 ping 循环（见 loadPersistedPings）
       persistPings();
 
       // KI-2：开启保温时**立即**落盘该 key 的请求体。
-      // 只在「真实请求到达」时落盘不够 —— 常见顺序是「先说话、后开保温」
-      // （先发消息，再点 ON / reconciler 补挂），那一刻 pings 里还没有该 key，
-      // 落盘钩子不触发，sidecar 一重启就丢。此处补上。
       persistBodies();
 
-      // 开启即立即执行一次 ping（不等首个 interval），结果经 /control/state 轮询可见。
-      // runPing 内的 <10s 真实请求顺延 30s 保护对此同样生效。
-      setImmediate(() => runPing(key));
+      // 开启即立即探测一次（不等首个窗口），结果经 /control/state 轮询可见。
+      // 命中则顺延锚点；429/网络错误等仅记录（突发重试只发生在窗口内）。
+      setImmediate(() => attemptPing(key));
 
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
@@ -1493,6 +1619,8 @@ const server = http.createServer((req, res) => {
         state: {
           key: state.key,
           on: state.on,
+          windowStartMin: state.windowStartMin,
+          windowEndMin: state.windowEndMin,
           intervalMin: state.intervalMin,
           lastPingAt: state.lastPingAt,
           pingCount: state.pingCount,
@@ -1516,15 +1644,13 @@ const server = http.createServer((req, res) => {
         body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       } catch (e) {}
       const key = body?.key;
-      if (key && pingTimers.has(key)) {
-        clearInterval(pingTimers.get(key));
-        pingTimers.delete(key);
-      }
+      if (key) clearPingTimers(key);
       if (key && pings.has(key)) {
         bumpGeneration(key);   // T21：旧代在途响应作废
         const p = pings.get(key);
         p.on = false;
         p.waitingForRequest = false;
+        p.burst = null;
         // 2026-10-24 独立审计修复：显式 OFF 必须同时清熔断标记 ——
         // persistPings 现在会把 on=false 且带 autoOffedAt 的条目当"熔断记录"
         // 持久化；用户显式关闭后若不清除，persistDeleteKey + persistPings 的
@@ -1532,15 +1658,6 @@ const server = http.createServer((req, res) => {
         // 语义：用户显式 OFF 优先于熔断记忆（关闭即放弃对该 key 的一切管理）。
         p.autoOffedAt = null;
         p.blockedReason = null;
-        if (p.retryTimer) {
-          clearTimeout(p.retryTimer);
-          p.retryTimer = null;
-        }
-        // 审计 §5：顺延 timer 旧实现没有句柄、OFF 无法取消，会留下野回调
-        if (p.deferTimer) {
-          clearTimeout(p.deferTimer);
-          p.deferTimer = null;
-        }
         pendingPingKeys.delete(key);
         // KI-2：关闭保温即删除其持久化请求体（不留存不必要的隐私数据）
         persistDeleteKey(key);
@@ -1628,11 +1745,11 @@ const server = http.createServer((req, res) => {
             }
           }
 
-          // 若有活跃 ping 循环但处于 stale 状态，真实流量到达时自动清 stale 并恢复循环
+          // 真实流量到达：重锚窗口（2026-10-25 区间突发引擎）
+          // 真实请求本身就是一次缓存确认触碰 → anchorMs=now，取消在途突发，
+          // 预约 anchor+windowStartMin 的下一个窗口。waiting/stale 同步自愈。
           if (pings.has(currentKey)) {
             const p = pings.get(currentKey);
-            // waiting 状态（sidecar 重启后 /control/on 409 记录的保温意图）：
-            // 真实请求到达 -> 请求体已记录，立即恢复 ping 循环
             const wasWaiting = p.waitingForRequest === true;
             if (wasWaiting) {
               p.waitingForRequest = false;
@@ -1644,12 +1761,12 @@ const server = http.createServer((req, res) => {
               p.consecutiveZeroCacheRead = 0;
               console.log(`[ping] key=${currentKey} cleared stale by real traffic`);
             }
-            if (p.on && !pingTimers.has(currentKey)) {
-              const timer = setInterval(() => runPing(currentKey), p.intervalMin * 60 * 1000);
-              if (timer.unref) timer.unref();
-              pingTimers.set(currentKey, timer);
-              // waiting 恢复时立即 ping 一次确认 cache 状态（受 <10s 顺延 30s 保护约束）
-              if (wasWaiting) setImmediate(() => runPing(currentKey));
+            if (p.on) {
+              p.burst = null;
+              p.anchorMs = Date.now();
+              scheduleWindow(currentKey);
+              // waiting 恢复时立即探测一次确认 cache 状态（命中则自然重锚）
+              if (wasWaiting) setImmediate(() => attemptPing(currentKey));
             }
             // KI-2：保温中的请求体落盘，供 sidecar 重启后恢复（只存 on 的 key）
             if (p.on) persistBodies();
