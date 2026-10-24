@@ -384,6 +384,83 @@ function persistDeleteKey(key) {
   } catch (e) {}
 }
 
+
+// ── 工具门控（tool gate，2026-10-24 生产事故产物）─────────────────────────
+// 事故：全局挂载的 rea MCP 给每个请求带来 207 个工具 / 652KB schema（单个
+// compare_web_captures 达 161.8KB），Kimi /coding 按单工具 schema 体积上限
+// 直接 400（"moonshot flavored json schema … exceeds maximum allowed size"）。
+// dsh 的 MCP 注册在 Host 启动期合成、无热切换（dsh-mcp-client 自己的错误
+// 提示就是 "reload the plugin or restart the Host"），而 rea 对其他 provider
+// （直连、不经本 sidecar）仍有用 —— 因此在 kimi 出站路径上按前缀剥除：
+// rea 保持全局挂载，kimi 会话按本开关瘦身，即点即生效、零重启。
+//
+// 关键不变量：剥除发生在入站解析段（TTL/身份注入之后、序列化与录制之前），
+// 因此**录制体 == 实际出站体**，保温 ping 的逐字节重放语义不受影响。
+const TOOLGATE_FILE = path.join(PERSIST_DIR, 'toolgate.json');
+const TOOLGATE_PREFIX_RE = /^[A-Za-z0-9_]{2,64}$/;
+const toolGate = {
+  // 默认关：通用 sidecar 不替用户做主；部署方按需开启（生产已于 2026-10-24 开启）。
+  enabled: false,
+  dropPrefixes: ['mcp__rea__'],
+  stats: { gatedRequests: 0, strippedTools: 0, savedBytes: 0, lastAt: null },
+};
+
+function loadToolGate() {
+  const saved = readJsonFile(TOOLGATE_FILE, null);
+  if (!saved || typeof saved !== 'object') return;
+  if (typeof saved.enabled === 'boolean') toolGate.enabled = saved.enabled;
+  if (Array.isArray(saved.dropPrefixes)) {
+    toolGate.dropPrefixes = saved.dropPrefixes.filter(
+      (p) => typeof p === 'string' && TOOLGATE_PREFIX_RE.test(p));
+  }
+  if (saved.stats && typeof saved.stats === 'object') {
+    toolGate.stats.gatedRequests = Number(saved.stats.gatedRequests) || 0;
+    toolGate.stats.strippedTools = Number(saved.stats.strippedTools) || 0;
+    toolGate.stats.savedBytes = Number(saved.stats.savedBytes) || 0;
+    toolGate.stats.lastAt = saved.stats.lastAt || null;
+  }
+  console.log(`[toolgate] loaded: enabled=${toolGate.enabled} prefixes=${JSON.stringify(toolGate.dropPrefixes)}`);
+}
+
+function persistToolGate() {
+  try {
+    writeJsonAtomic(TOOLGATE_FILE, {
+      enabled: toolGate.enabled,
+      dropPrefixes: toolGate.dropPrefixes,
+      stats: toolGate.stats,
+      updatedAt: Date.now(),
+    });
+  } catch (e) {
+    console.log('[persist] toolgate write failed:', String(e && e.message ? e.message : e));
+  }
+}
+
+/**
+ * 就地剥除 j.tools 中名字命中 dropPrefixes 前缀的工具。
+ * 兼容两种工具形态：OpenAI（function.name）与 Anthropic（name/input_schema）。
+ * @returns {null|{dropped:number, savedBytes:number}} null=未启用/无 tools/未命中。
+ */
+function applyToolGate(j) {
+  if (!toolGate.enabled || !Array.isArray(j.tools) || j.tools.length === 0) return null;
+  if (toolGate.dropPrefixes.length === 0) return null;
+  const nameOf = (t) => (t && (t.function?.name || t.name)) || '';
+  const keep = j.tools.filter((t) => {
+    const n = nameOf(t);
+    return !toolGate.dropPrefixes.some((p) => n.startsWith(p));
+  });
+  if (keep.length === j.tools.length) return null;
+  const beforeBytes = Buffer.byteLength(JSON.stringify(j.tools), 'utf8');
+  const dropped = j.tools.length - keep.length;
+  j.tools = keep;
+  const savedBytes = beforeBytes - Buffer.byteLength(JSON.stringify(j.tools), 'utf8');
+  toolGate.stats.gatedRequests += 1;
+  toolGate.stats.strippedTools += dropped;
+  toolGate.stats.savedBytes += savedBytes;
+  toolGate.stats.lastAt = new Date().toISOString();
+  persistToolGate();
+  return { dropped, savedBytes };
+}
+
 /**
  * ——— 2026-10-23 审计 T16：重启后重建认证 ———
  * 只保存**凭据来源引用**（env 变量名），绝不落盘原始 Authorization 头。
@@ -1049,7 +1126,7 @@ const server = http.createServer((req, res) => {
       capabilities: [
         'session-scoped-key', 'control-verify', 'selfcheck',
         'persist-bodies', 'persist-pings', 'single-inflight',
-        'usage-normalized',
+        'usage-normalized', 'tool-gate',
       ],
     }));
     return;
@@ -1144,6 +1221,56 @@ const server = http.createServer((req, res) => {
       result.ok = result.reasons.length === 0;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(result));
+    });
+    return;
+  }
+
+  // B7: GET/POST /control/toolgate —— 工具门控开关（2026-10-24）
+  if (req.url === '/control/toolgate' && (req.method === 'GET' || req.method === 'POST')) {
+    if (req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        enabled: toolGate.enabled,
+        dropPrefixes: toolGate.dropPrefixes,
+        stats: toolGate.stats,
+      }));
+      return;
+    }
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid-json' }));
+        return;
+      }
+      if (body && typeof body.enabled !== 'undefined' && typeof body.enabled !== 'boolean') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'enabled-must-be-boolean' }));
+        return;
+      }
+      if (body && typeof body.dropPrefixes !== 'undefined') {
+        if (!Array.isArray(body.dropPrefixes) || body.dropPrefixes.length > 16 ||
+            !body.dropPrefixes.every((p) => typeof p === 'string' && TOOLGATE_PREFIX_RE.test(p))) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid-drop-prefixes' }));
+          return;
+        }
+      }
+      if (typeof body?.enabled === 'boolean') toolGate.enabled = body.enabled;
+      if (Array.isArray(body?.dropPrefixes)) toolGate.dropPrefixes = body.dropPrefixes.slice();
+      persistToolGate();
+      console.log(`[toolgate] set: enabled=${toolGate.enabled} prefixes=${JSON.stringify(toolGate.dropPrefixes)}`);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        enabled: toolGate.enabled,
+        dropPrefixes: toolGate.dropPrefixes,
+        stats: toolGate.stats,
+      }));
     });
     return;
   }
@@ -1463,6 +1590,10 @@ const server = http.createServer((req, res) => {
             }
           }
         }
+        // 工具门控：必须在录制（recordedRequests.set）与转发之前剥除，
+        // 保证"录制体 == 出站体"，ping 逐字节重放无需感知门控的存在。
+        const gateMark = applyToolGate(j);
+        if (gateMark) injected.push('tool-gate=' + gateMark.dropped);
         currentModel = j.model || 'unknown';
         body = Buffer.from(JSON.stringify(j), 'utf8');
 
@@ -1597,6 +1728,7 @@ if (require.main === module) {
     if (p.restored > 0 || p.waiting > 0) {
       console.log(`[persist] restored ${p.restored} ping loop(s), ${p.waiting} waiting for real request`);
     }
+    loadToolGate();
     // 一致性回写：此时两份数据都在内存里，写回是安全的（合并语义不会丢条目）
     persistPings();
     persistBodies();
@@ -1637,6 +1769,11 @@ module.exports = {
   persistPings,
   loadPersistedPings,
   persistDeleteKey,
+  applyToolGate,
+  toolGate,
+  persistToolGate,
+  loadToolGate,
+  TOOLGATE_FILE,
   runSelfCheck,
   totalInputTokens,
   PERSIST_FILE,

@@ -5,8 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { getDefaultStatePath, readState } from './state.mjs';
-import { sidecarControlState, sidecarSessions, sidecarSelfCheck } from './sidecar-client.mjs';
-import { parseHtoParam, executeHton, executeHtoff, executeHto } from './commands.mjs';
+import { sidecarControlState, sidecarSessions, sidecarSelfCheck, sidecarToolGateGet, sidecarToolGateSet } from './sidecar-client.mjs';
+import { parseHtoParam, executeHton, executeHtoff, executeHto, executeTgon, executeTgoff, executeTgstatus } from './commands.mjs';
 import { getAllSessionIds, getArchivedIds, startReconciler } from './reconciler.mjs';
 import { sessionKeyFor } from './keys.mjs';
 
@@ -144,6 +144,13 @@ function hookTelegramDutyCommands(statePath, ctx) {
               const targetSessionId = env?.targetSessionId || 'telegram-duty';
               return await executeHto(args, targetSessionId, statePath);
             },
+          };
+        }
+        if (lower === 'tgon' || lower === 'tgoff' || lower === 'tg') {
+          const fn = lower === 'tgon' ? executeTgon : (lower === 'tgoff' ? executeTgoff : executeTgstatus);
+          return {
+            name: lower, aliases: [lower.toUpperCase()],
+            handler: async () => await fn(),
           };
         }
         return origResolve.call(this, cmdName);
@@ -285,6 +292,26 @@ export function apply(ctx) {
         return { kind: 'success', text };
       },
     });
+
+    // 工具门控（2026-10-24）：kimi 出站按前缀剥除 MCP 工具（rea 652KB schema 事故）
+    const registerToolGateCommands = (c) => {
+      c.commands.register({
+        name: 'tgon',
+        description: '开启工具门控（kimi 出站按前缀剥除工具，即时生效）',
+        handler: async () => ({ kind: 'success', text: await executeTgon() }),
+      });
+      c.commands.register({
+        name: 'tgoff',
+        description: '关闭工具门控（kimi 出站原样透传）',
+        handler: async () => ({ kind: 'success', text: await executeTgoff() }),
+      });
+      c.commands.register({
+        name: 'tg',
+        description: '查看工具门控状态与累计统计',
+        handler: async () => ({ kind: 'success', text: await executeTgstatus() }),
+      });
+    };
+    registerToolGateCommands(cmdCtx);
 
     // 兼容大写命令
     try {
@@ -501,6 +528,28 @@ export function apply(ctx) {
             return;
           }
           sendJson(res, 200, { ok: true, text, session: updated });
+          return;
+        }
+
+        // 工具门控（2026-10-24）：插件代理 sidecar 的 /control/toolgate，
+        // 供 TOOL GATE tab 使用。sidecar 不可达/旧版时如实 503，不猜状态。
+        if (pathname === '/heartbeat/api/toolgate' && req.method === 'GET') {
+          const g = await sidecarToolGateGet();
+          if (!g) {
+            sendJson(res, 503, { error: 'sidecar-unreachable-or-legacy' });
+            return;
+          }
+          sendJson(res, 200, g);
+          return;
+        }
+        if (pathname === '/heartbeat/api/toolgate' && req.method === 'POST') {
+          const body = await readJsonBody(req);
+          const res2 = await sidecarToolGateSet(body || {});
+          if (!res2 || res2.status !== 200) {
+            sendJson(res, (res2 && res2.status) || 503, (res2 && res2.data) || { error: 'sidecar-unreachable' });
+            return;
+          }
+          sendJson(res, 200, res2.data);
           return;
         }
 

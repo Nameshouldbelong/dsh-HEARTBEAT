@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
-import { parseHtoParam, executeHton, executeHtoff, executeHto } from '../lib/commands.mjs';
+import { parseHtoParam, executeHton, executeHtoff, executeHto, executeTgon, executeTgoff, executeTgstatus } from '../lib/commands.mjs';
 import { sessionKeyFor } from '../lib/keys.mjs';
 import { readState } from '../lib/state.mjs';
 
@@ -225,4 +225,51 @@ test('第八章: sidecar 不可达 -> 诚实回执，不假装开启', async (t)
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }
+});
+
+// ── 工具门控指令（2026-10-24）────────────────────────────────────────────
+test('TG 指令: /TGON /TGOFF /TG 经 sidecar /control/toolgate，回报状态与统计', async (t) => {
+  const seen = [];
+  const gateState = {
+    enabled: false,
+    dropPrefixes: ['mcp__rea__'],
+    stats: { gatedRequests: 3, strippedTools: 621, savedBytes: 668000, lastAt: null },
+  };
+  await startFakeSidecar(t, (url, body) => {
+    if (url === '/control/toolgate') {
+      if (body) {
+        const req = JSON.parse(body);
+        if (typeof req.enabled === 'boolean') gateState.enabled = req.enabled;
+        seen.push({ ...req });
+        return { status: 200, json: { ok: true, ...gateState } };
+      }
+      return { status: 200, json: { ...gateState } };
+    }
+    return defaultBehavior(url, body);
+  });
+
+  const on = await executeTgon();
+  assert.ok(on.includes('工具门控已开启'), on);
+  assert.ok(on.includes('mcp__rea__'), '回报应含剥除前缀');
+  assert.ok(on.includes('621'), '回报应含累计统计');
+  assert.deepEqual(seen, [{ enabled: true }], '恰好一次 POST enabled=true');
+
+  const off = await executeTgoff();
+  assert.ok(off.includes('工具门控已关闭'), off);
+  assert.ok(off.includes('400'), '关闭回执应如实提示 Kimi 400 风险');
+
+  const st = await executeTgstatus();
+  assert.ok(st.includes('工具门控：关闭'), st);
+});
+
+test('TG 指令: sidecar 不可达时不谎报（⚠️ 回执）', async (t) => {
+  const prev = process.env.SIDECAR_PORT;
+  process.env.SIDECAR_PORT = '1'; // 无监听端口，立即 ECONNREFUSED
+  t.after(() => {
+    if (prev === undefined) delete process.env.SIDECAR_PORT;
+    else process.env.SIDECAR_PORT = prev;
+  });
+  const r = await executeTgon();
+  assert.ok(r.includes('⚠️'), r);
+  assert.ok(r.includes('未响应'), r);
 });

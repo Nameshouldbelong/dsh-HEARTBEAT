@@ -4,6 +4,8 @@ import {
   sidecarControlOff,
   sidecarVerify,
   sidecarSessions,
+  sidecarToolGateGet,
+  sidecarToolGateSet,
 } from './sidecar-client.mjs';
 import { sessionKeyFor } from './keys.mjs';
 
@@ -204,4 +206,35 @@ export async function executeHto(arg, sessionId, statePath, opts = {}) {
     receipt += '\n⚠️ 间隔≥40min：实测缓存存活约 28–45min，可能来不及续期';
   }
   return receipt;
+}
+
+// ── 工具门控指令（2026-10-24，rea MCP 652KB schema 触发 Kimi 400 的产物）──
+// 语义：门控只作用于 kimi 出站（经 sidecar 的请求）；其他 provider 直连
+// 不受影响。开启后按前缀剥除工具，即点即生效，无需重启 dsh。
+function toolGateReceipt(g) {
+  const kb = (n) => (Number(n) / 1024).toFixed(1) + 'KB';
+  return `剥除前缀：${g.dropPrefixes.join(', ')}｜累计剥除 ${g.stats.strippedTools} 个工具 / ${kb(g.stats.savedBytes)}（${g.stats.gatedRequests} 次请求）`;
+}
+
+export async function executeTgon() {
+  const res = await sidecarToolGateSet({ enabled: true }).catch(() => null);
+  if (!res || res.status !== 200) {
+    return `⚠️ sidecar 未响应（${res ? 'HTTP ' + res.status : 'no-response'}），工具门控状态未确认`;
+  }
+  return `🚪 工具门控已开启（kimi 出站按前缀剥除）\n${toolGateReceipt(res.data)}`;
+}
+
+export async function executeTgoff() {
+  const res = await sidecarToolGateSet({ enabled: false }).catch(() => null);
+  if (!res || res.status !== 200) {
+    return `⚠️ sidecar 未响应（${res ? 'HTTP ' + res.status : 'no-response'}），工具门控状态未确认`;
+  }
+  const g = res.data;
+  return `🚪 工具门控已关闭（kimi 出站原样透传，带超限 schema 的请求将被 Kimi 400）\n前缀保留：${g.dropPrefixes.join(', ')}`;
+}
+
+export async function executeTgstatus() {
+  const g = await sidecarToolGateGet().catch(() => null);
+  if (!g) return '⚠️ sidecar 未响应或为旧版（无 /control/toolgate）';
+  return `🚪 工具门控：${g.enabled ? '开启' : '关闭'}\n${toolGateReceipt(g)}`;
 }

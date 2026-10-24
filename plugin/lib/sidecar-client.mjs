@@ -109,3 +109,19 @@ export async function sidecarVerify({ key, sessionId, expectedPromptTokens, tole
     timeout: 5000,
   });
 }
+
+// 工具门控（2026-10-24）：读取/设置 kimi 出站的工具剥除开关。
+// 返回 null 表示 sidecar 不可达或旧版无该端点（面板显示"不可用"而不是猜状态）。
+export async function sidecarToolGateGet() {
+  const res = await sidecarRequest('/control/toolgate');
+  if (res.status === 200 && res.data && typeof res.data === 'object') return res.data;
+  return null;
+}
+
+export async function sidecarToolGateSet(payload) {
+  return sidecarRequest('/control/toolgate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
