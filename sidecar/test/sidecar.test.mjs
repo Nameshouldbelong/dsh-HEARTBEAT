@@ -1848,6 +1848,11 @@ test('tool-gate: 端到端——出站剥除、录制体==出站体（ping 重�
   const origEnabled = sidecar.toolGate.enabled;
   const origPrefixes = sidecar.toolGate.dropPrefixes.slice();
   const origStats = { ...sidecar.toolGate.stats };
+  // 隔离前序测试遗留的 pings/timers（waiting 迁移会触发立即探测，污染字节断言）
+  for (const k of Array.from(sidecar.pings.keys())) {
+    sidecar.clearPingTimers(k);
+    sidecar.pings.delete(k);
+  }
 
   let lastUpstreamBody = null;
   const mockUpstream = http.createServer((req, res) => {
