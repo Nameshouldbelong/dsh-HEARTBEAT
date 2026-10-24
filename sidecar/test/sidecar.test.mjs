@@ -1769,3 +1769,186 @@ test('2026-10-24 独立审计: /control/off 显式关闭必须清除熔断标记
     try { fs.rmSync(file, { force: true }); } catch {}
   }
 });
+
+// ── 工具门控（2026-10-24）：rea MCP 652KB schema 触发 Kimi 400 的产物 ─────
+test('tool-gate: applyToolGate 单元语义（未启用/前缀命中/两形态/统计与持久化恢复）', async () => {
+  const fs = await import('node:fs');
+  const origEnabled = sidecar.toolGate.enabled;
+  const origPrefixes = sidecar.toolGate.dropPrefixes.slice();
+  const origStats = { ...sidecar.toolGate.stats };
+  try {
+    // 未启用：任何 tools 都不动，返回 null
+    const j1 = { model: 'k3', tools: [{ type: 'function', function: { name: 'mcp__rea__x', parameters: {} } }] };
+    assert.equal(sidecar.applyToolGate(j1), null, '未启用时必须原样');
+    assert.equal(j1.tools.length, 1);
+
+    // 启用：openai（function.name）与 anthropic（name/input_schema）两种形态都按前缀剥
+    sidecar.toolGate.enabled = true;
+    const j2 = {
+      model: 'k3.1-pro',
+      tools: [
+        { type: 'function', function: { name: 'mcp__rea__compare_web_captures', parameters: { type: 'object' } } },
+        { name: 'mcp__rea__legacy_form', input_schema: { type: 'object' } },
+        { type: 'function', function: { name: 'Read', parameters: { type: 'object' } } },
+      ],
+    };
+    const r2 = sidecar.applyToolGate(j2);
+    assert.ok(r2, '启用且命中时应返回标记');
+    assert.equal(r2.dropped, 2, '两个 mcp__rea__ 工具都应剥除');
+    assert.ok(r2.savedBytes > 0);
+    assert.equal(j2.tools.length, 1, '只留 builtin');
+    assert.equal(j2.tools[0].function.name, 'Read');
+
+    // 统计累计 + 落盘 0600 + 重启恢复（loadToolGate）
+    const file = sidecar.TOOLGATE_FILE;
+    const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(st.enabled, true);
+    assert.ok(st.stats.strippedTools >= 2, '统计应累计');
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'toolgate.json 必须 0600');
+    sidecar.toolGate.enabled = false;
+    sidecar.toolGate.stats.strippedTools = 0;
+    sidecar.loadToolGate();
+    assert.equal(sidecar.toolGate.enabled, true, '重启后开关状态应恢复');
+    assert.ok(sidecar.toolGate.stats.strippedTools >= 2, '重启后统计应延续');
+
+    // 空前缀表：不剥
+    sidecar.toolGate.dropPrefixes = [];
+    const j3 = { tools: [{ function: { name: 'mcp__rea__x' } }] };
+    assert.equal(sidecar.applyToolGate(j3), null, '空前缀表等于关闭');
+    assert.equal(j3.tools.length, 1);
+  } finally {
+    sidecar.toolGate.enabled = origEnabled;
+    sidecar.toolGate.dropPrefixes = origPrefixes;
+    sidecar.toolGate.stats = origStats;
+    try { fs.rmSync(sidecar.TOOLGATE_FILE, { force: true }); } catch {}
+  }
+});
+
+test('tool-gate: 端到端——出站剥除、录制体==出站体（ping 重放语义）、/control/toolgate 校验', async (t) => {
+  const fs = await import('node:fs');
+  const origEnabled = sidecar.toolGate.enabled;
+  const origPrefixes = sidecar.toolGate.dropPrefixes.slice();
+  const origStats = { ...sidecar.toolGate.stats };
+
+  let lastUpstreamBody = null;
+  const mockUpstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      lastUpstreamBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-tg', usage: { prompt_tokens: 100, completion_tokens: 5, total_tokens: 105, cached_tokens: 0 },
+      }));
+    });
+  });
+  await new Promise((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  process.env.UPSTREAM_HOST = '127.0.0.1';
+  process.env.UPSTREAM_PORT = String(mockUpstream.address().port);
+  process.env.UPSTREAM_PROTOCOL = 'http';
+  process.env.UPSTREAM_PREFIX = '/coding';
+  const testSidecar = sidecar.server;
+  await new Promise((r) => testSidecar.listen(0, '127.0.0.1', r));
+  const sidecarPort = testSidecar.address().port;
+
+  t.after(() => {
+    mockUpstream.close();
+    testSidecar.close();
+    sidecar.toolGate.enabled = origEnabled;
+    sidecar.toolGate.dropPrefixes = origPrefixes;
+    sidecar.toolGate.stats = origStats;
+    try { fs.rmSync(sidecar.TOOLGATE_FILE, { force: true }); } catch {}
+  });
+
+  const request = (path, options = {}) => new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: '127.0.0.1', port: sidecarPort, path, method: options.method || 'GET', headers: options.headers || {} },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          try { resolve({ status: res.statusCode, json: JSON.parse(body) }); }
+          catch { resolve({ status: res.statusCode, text: body }); }
+        });
+      }
+    );
+    req.on('error', reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+
+  // 1) GET 初始状态合法
+  const g0 = await request('/control/toolgate');
+  assert.equal(g0.status, 200);
+  assert.equal(typeof g0.json.enabled, 'boolean');
+  assert.ok(Array.isArray(g0.json.dropPrefixes));
+
+  // 2) POST 开启
+  const set = await request('/control/toolgate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(set.status, 200);
+  assert.equal(set.json.enabled, true);
+
+  // 3) 非法前缀被拒（含非法字符）
+  const bad = await request('/control/toolgate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ dropPrefixes: ['x!'] }),
+  });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.json.error, 'invalid-drop-prefixes');
+  // 3b) enabled 非布尔被拒
+  const bad2 = await request('/control/toolgate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: 'yes' }),
+  });
+  assert.equal(bad2.status, 400);
+
+  // 4) 带超限工具的真实请求：上游收到已剥除的体；录制体与出站体逐字节一致
+  const sess = 'session-tg-e2e';
+  const aff = sidecar.affinityKey({ metadata: { user_id: sess } });
+  const big = 'B'.repeat(170000); // 模拟 161.8KB 级别的病态 schema
+  const payload = {
+    model: 'k3.1-pro',
+    metadata: { user_id: sess },
+    max_tokens: 128,
+    tools: [
+      { type: 'function', function: { name: 'mcp__rea__compare_web_captures', parameters: { type: 'object', properties: { blob: { type: 'string', description: big } } } } },
+      { type: 'function', function: { name: 'Read', parameters: { type: 'object' } } },
+    ],
+    messages: [{ role: 'user', content: 'hi' }],
+  };
+  const r1 = await request('/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(r1.status, 200);
+  const up = JSON.parse(lastUpstreamBody);
+  assert.equal(up.tools.length, 1, '上游只应看到未被剥除的工具');
+  assert.equal(up.tools[0].function.name, 'Read');
+  const rec = sidecar.recordedRequests.get(aff.id);
+  assert.ok(rec, '应按会话键录制');
+  assert.equal(JSON.parse(rec.body.toString('utf8')).tools.length, 1, '录制体也是剥除后的');
+  assert.equal(rec.body.toString('utf8'), lastUpstreamBody, '录制体必须与实际出站体逐字节一致（ping 重放语义）');
+
+  // 5) 统计经 GET 可见
+  const g1 = await request('/control/toolgate');
+  assert.ok(g1.json.stats.strippedTools >= 1);
+  assert.ok(g1.json.stats.savedBytes > 100000, '170KB 的 schema 应省下 >100KB');
+
+  // 6) 关闭后原样透传（重现 Kimi 400 的条件，但 mock 上游不校验）
+  const off = await request('/control/toolgate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(off.status, 200);
+  const r2 = await request('/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(r2.status, 200);
+  const up2 = JSON.parse(lastUpstreamBody);
+  assert.equal(up2.tools.length, 2, '关闭后工具原样透传');
+});

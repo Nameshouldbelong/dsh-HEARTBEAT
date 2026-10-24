@@ -522,7 +522,101 @@ function createHeartbeatClient(React) {
     );
   }
 
-  return { HeartbeatTabView };
+  // ── TOOL GATE tab（2026-10-24）───────────────────────────────────────────
+  // 背景：全局挂载的 rea MCP（207 工具/652KB schema）触发 Kimi /coding 的
+  // "schema exceeds maximum allowed size" 400。dsh 的 MCP 注册无热切换，
+  // 故由 sidecar 在 kimi 出站按前缀剥除；本面板是它的开关（经插件代理，
+  // 不直连 sidecar）。轮询沿用 U07 单在途契约。
+  function ToolGateTabView(props) {
+    const [gate, setGate] = useState(null);
+    const [error, setError] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const poll = { inFlight: false };
+
+    const fetchGate = useCallback(async () => {
+      if (poll.inFlight) return;
+      poll.inFlight = true;
+      try {
+        const res = await fetch('/heartbeat/api/toolgate');
+        if (!res.ok) {
+          throw new Error(res.status === 503 ? 'sidecar 不可达或为旧版（无 /control/toolgate）' : `HTTP ${res.status}`);
+        }
+        setGate(await res.json());
+        setError(null);
+      } catch (err) {
+        setError(String(err && err.message ? err.message : err));
+      } finally {
+        poll.inFlight = false;
+      }
+    }, []);
+
+    useEffect(() => {
+      void fetchGate();
+      const timer = setInterval(() => { void fetchGate(); }, 5000);
+      return () => clearInterval(timer);
+    }, [fetchGate]);
+
+    const toggle = async () => {
+      if (!gate || busy) return;
+      setBusy(true);
+      try {
+        const res = await fetch('/heartbeat/api/toolgate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: !gate.enabled }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        setGate(data);
+        setError(null);
+      } catch (err) {
+        setError(String(err && err.message ? err.message : err));
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const kb = (n) => (Number(n) / 1024).toFixed(1) + ' KB';
+    return h('div', { className: 'hb-container' },
+      h('div', { className: 'hb-header' },
+        h('div', null,
+          h('h3', { className: 'hb-title' }, '🚪 TOOL GATE'),
+          h('div', { className: 'hb-subtitle' },
+            'kimi 出站工具门控：按前缀剥除超限 MCP 工具，即时生效、零重启；其他 provider 直连不经 sidecar，不受影响')
+        ),
+        h('button', { type: 'button', className: 'hb-refresh-btn', onClick: () => { void fetchGate(); } }, '刷新')
+      ),
+      error
+        ? h('div', { className: 'hb-info-banner', style: { borderColor: 'rgba(239,68,68,.4)', background: 'rgba(239,68,68,.08)' } }, '⚠️ ' + error)
+        : null,
+      gate
+        ? h('div', null,
+            h('div', { className: 'hb-info-banner' },
+              h('div', null, h('strong', null, '状态：' + (gate.enabled ? '开启（按前缀剥除中）' : '关闭（原样透传）'))),
+              h('div', { className: 'hb-mono', style: { marginTop: 6 } }, '剥除前缀：' + (gate.dropPrefixes || []).join(', ')),
+              gate.stats
+                ? h('div', { className: 'hb-mono', style: { marginTop: 4 } },
+                    `累计：${gate.stats.gatedRequests} 次请求 | 剥除 ${gate.stats.strippedTools} 个工具 | 节省 ${kb(gate.stats.savedBytes)}` +
+                    (gate.stats.lastAt ? ` | 最近：${new Date(gate.stats.lastAt).toLocaleTimeString()}` : ''))
+                : null
+            ),
+            h('div', null,
+              h('button', {
+                type: 'button',
+                className: `hb-btn-toggle ${gate.enabled ? 'hb-btn-turn-off' : 'hb-btn-turn-on'}`,
+                disabled: busy,
+                onClick: () => { void toggle(); },
+              }, busy ? '…' : (gate.enabled ? '关闭门控 (OFF)' : '开启门控 (ON)')),
+              gate.enabled
+                ? h('span', { className: 'hb-mono', style: { marginLeft: 10 } }, '开启时：kimi 会话的模型看不到被剥除的工具')
+                : h('span', { className: 'hb-mono', style: { marginLeft: 10, color: '#f59e0b' } }, '⚠️ 关闭期间：带超限 schema 的 kimi 请求将被 Kimi 400')
+            )
+          )
+        : (!error ? h('div', { className: 'hb-empty' }, '加载中…') : null)
+    );
+  }
+
+  return { HeartbeatTabView, ToolGateTabView };
 }
 
 const inject = ['slots'];
@@ -539,7 +633,7 @@ function apply(ctx) {
     return;
   }
 
-  const { HeartbeatTabView } = createHeartbeatClient(React);
+  const { HeartbeatTabView, ToolGateTabView } = createHeartbeatClient(React);
 
   // 注入样式
   ctx.effect(() => {
@@ -562,6 +656,16 @@ function apply(ctx) {
       label: () => 'HEARTBEAT',
     }, (props) => React.createElement(HeartbeatTabView, props))
   );
+
+  // 注册顶部栏 TOOL GATE tab（order 106，紧随 HEARTBEAT）
+  ctx.slots.inject('conversation.view', () =>
+    ctx.slots.register({
+      name: 'conversation.view',
+      id: 'toolgate',
+      order: 106,
+      label: () => 'TOOL GATE',
+    }, (props) => React.createElement(ToolGateTabView, props))
+  );
 }
 
 // 兼容 DSH ModuleLoader 与 ESM
@@ -569,7 +673,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
   const factory = (require) => {
     const module = { exports: {} };
     const React = require('react');
-    const { HeartbeatTabView } = createHeartbeatClient(React);
+    const { HeartbeatTabView, ToolGateTabView } = createHeartbeatClient(React);
 
     module.exports = {
       inject: ['slots'],
@@ -592,6 +696,15 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
             order: 105,
             label: () => 'HEARTBEAT',
           }, (props) => React.createElement(HeartbeatTabView, props))
+        );
+
+        ctx.slots.inject('conversation.view', () =>
+          ctx.slots.register({
+            name: 'conversation.view',
+            id: 'toolgate',
+            order: 106,
+            label: () => 'TOOL GATE',
+          }, (props) => React.createElement(ToolGateTabView, props))
         );
       },
     };
