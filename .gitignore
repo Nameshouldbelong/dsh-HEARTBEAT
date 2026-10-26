@@ -1,0 +1,11 @@
+node_modules/
+*.log
+**/usage.jsonl
+.DS_Store
+
+# 运行时持久化数据（含完整 LLM 请求体/对话历史，严禁入库）
+sidecar/persist/
+**/persist/
+
+# 手工备份文件
+*.bak-*
