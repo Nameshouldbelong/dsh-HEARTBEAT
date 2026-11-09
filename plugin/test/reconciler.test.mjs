@@ -6,6 +6,7 @@ import os from 'node:os';
 import http from 'node:http';
 import { runReconciliation } from '../lib/reconciler.mjs';
 import { readState, updateSessionState } from '../lib/state.mjs';
+import { sessionKeyFor } from '../lib/keys.mjs';
 
 // 确定性 fake sidecar（不依赖本机真实 sidecar 8791）
 async function startFakeSidecar(t, behavior) {
@@ -27,9 +28,10 @@ async function startFakeSidecar(t, behavior) {
   return server;
 }
 
-// 默认行为：/control/on 一律 200（补挂成功），/sessions 为空
+// 默认行为：/control/on 一律 200（补挂成功），/sessions 为空，verify 通过
 const defaultBehavior = (url) => {
   if (url === '/sessions') return { status: 200, json: { sessions: [] } };
+  if (url === '/control/verify') return { status: 200, json: { ok: true, actualPromptTokens: 100 } };
   if (url === '/control/on') return { status: 200, json: { ok: true, immediatePing: true, state: {} } };
   if (url === '/control/off') return { status: 200, json: { ok: true } };
   return { status: 404, json: {} };
@@ -41,21 +43,22 @@ test('Contract-D: reconciler 对账（deleted/archived 会话置 OFF 并清理�
 
   try {
     // 初始化 3 个会话：
-    // sess-active: 活跃会话, on=true
+    // sess-active: 活跃会话, on=true, 派生 key
     // sess-archived: 已归档会话, on=true
     // sess-deleted: 已删除会话, on=false
+    const activeKey = sessionKeyFor('sess-active');
     updateSessionState(tmpFile, 'sess-active', {
-      key: 'dshsc-active',
+      key: activeKey,
       on: true,
       intervalMin: 30,
     });
     updateSessionState(tmpFile, 'sess-archived', {
-      key: 'dshsc-archived',
+      key: sessionKeyFor('sess-archived'),
       on: true,
       intervalMin: 50,
     });
     updateSessionState(tmpFile, 'sess-deleted', {
-      key: 'dshsc-deleted',
+      key: sessionKeyFor('sess-deleted'),
       on: false,
       intervalMin: 50,
     });
@@ -83,62 +86,78 @@ test('Contract-D: reconciler 对账（deleted/archived 会话置 OFF 并清理�
   }
 });
 
-test('KI-3: reconciler 对存储 key 漂移（409）自动轮换到新鲜 key', async (t) => {
+test('KI-3: reconciler 对存储 key 漂移（历史脏 key）自动纠正为确定性派生 key 并关停旧 key', async (t) => {
   const tmpFile = path.join(os.tmpdir(), `dsh-reconcile-ki3-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  const sessionId = 'sess-drift';
+  const derivedKey = sessionKeyFor(sessionId);
+  let turnedOffKey = null;
+
   await startFakeSidecar(t, (url, body) => {
     if (url === '/sessions') {
-      // 会话的新流量在 fresh key 下（system prompt 漂移后的新 hash）
-      return { status: 200, json: { sessions: [{ key: 'dshsc-fresh', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+      return { status: 200, json: { sessions: [{ key: derivedKey, lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+    }
+    if (url === '/control/verify') {
+      return { status: 200, json: { ok: true, actualPromptTokens: 100 } };
     }
     if (url === '/control/on') {
-      const key = JSON.parse(body || '{}').key;
-      if (key === 'dshsc-stale') return { status: 409, json: { error: 'no-request-recorded', waiting: true } };
-      if (key === 'dshsc-fresh') return { status: 200, json: { ok: true, immediatePing: true, state: {} } };
-      return { status: 409, json: { error: 'no-request-recorded', waiting: true } };
+      return { status: 200, json: { ok: true, immediatePing: true, state: {} } };
     }
-    if (url === '/control/off') return { status: 200, json: { ok: true } };
+    if (url === '/control/off') {
+      try {
+        turnedOffKey = JSON.parse(body || '{}').key;
+      } catch {}
+      return { status: 200, json: { ok: true } };
+    }
     return { status: 404, json: {} };
   });
 
   try {
-    updateSessionState(tmpFile, 'sess-drift', { key: 'dshsc-stale', on: true, intervalMin: 50, waiting: true });
+    updateSessionState(tmpFile, sessionId, { key: 'dshsc-stale', on: true, intervalMin: 50, waiting: true });
 
-    const report = await runReconciliation({ statePath: tmpFile, activeSessionIds: new Set(['sess-drift']) });
+    const report = await runReconciliation({ statePath: tmpFile, activeSessionIds: new Set([sessionId]) });
 
     const state = readState(tmpFile);
-    assert.equal(state.sessions['sess-drift'].key, 'dshsc-fresh', 'key 应轮换到新鲜值');
-    assert.equal(state.sessions['sess-drift'].waiting, false, 'waiting 应解除');
-    assert.equal(state.sessions['sess-drift'].on, true);
-    assert.ok(report.reconnected.includes('sess-drift'));
+    assert.equal(state.sessions[sessionId].key, derivedKey, 'key 应纠正为确定性派生 key');
+    assert.equal(state.sessions[sessionId].rekeyedFrom, 'dshsc-stale', '应记录旧 key 痕迹');
+    assert.equal(state.sessions[sessionId].on, false, '纠正 key 后应重置开启状态待重新校验');
+    assert.ok(report.rekeyed.some((r) => r.sessionId === sessionId && r.from === 'dshsc-stale' && r.to === derivedKey));
+    assert.equal(turnedOffKey, 'dshsc-stale', '应通知 sidecar 关停旧 key');
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }
 });
 
-test('KI-3: fresh key 已被其他开启会话认领时不抢（保持 waiting）', async (t) => {
+test('KI-3: 多会话基于 sessionId 独立派生 key，互不抢占且互不影响', async (t) => {
   const tmpFile = path.join(os.tmpdir(), `dsh-reconcile-ki3b-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-  await startFakeSidecar(t, (url, body) => {
+  const key1 = sessionKeyFor('sess-drift');
+  const key2 = sessionKeyFor('sess-other');
+
+  await startFakeSidecar(t, (url) => {
     if (url === '/sessions') {
-      return { status: 200, json: { sessions: [{ key: 'dshsc-other', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+      return { status: 200, json: { sessions: [{ key: key1 }, { key: key2 }] } };
+    }
+    if (url === '/control/verify') {
+      return { status: 200, json: { ok: true, actualPromptTokens: 100 } };
     }
     if (url === '/control/on') {
-      const key = JSON.parse(body || '{}').key;
-      if (key === 'dshsc-other') return { status: 200, json: { ok: true, state: {} } };
-      return { status: 409, json: { error: 'no-request-recorded', waiting: true } };
+      return { status: 200, json: { ok: true, state: {} } };
     }
     if (url === '/control/off') return { status: 200, json: { ok: true } };
     return { status: 404, json: {} };
   });
 
   try {
-    updateSessionState(tmpFile, 'sess-drift', { key: 'dshsc-stale', on: true, intervalMin: 50 });
-    updateSessionState(tmpFile, 'sess-other', { key: 'dshsc-other', on: true, intervalMin: 50 });
+    updateSessionState(tmpFile, 'sess-drift', { key: key1, on: true, intervalMin: 50 });
+    updateSessionState(tmpFile, 'sess-other', { key: key2, on: true, intervalMin: 50 });
 
     await runReconciliation({ statePath: tmpFile, activeSessionIds: new Set(['sess-drift', 'sess-other']) });
 
     const state = readState(tmpFile);
-    assert.equal(state.sessions['sess-drift'].key, 'dshsc-stale', '不得抢占其他会话的 key');
-    assert.equal(state.sessions['sess-drift'].waiting, true, '应保持 waiting');
+    assert.equal(state.sessions['sess-drift'].key, key1, '各会话保持各自确定性派生 key');
+    assert.equal(state.sessions['sess-other'].key, key2, '各会话保持各自确定性派生 key');
+    assert.notEqual(state.sessions['sess-drift'].key, state.sessions['sess-other'].key, '不同会话派生 key 必然互斥');
+    assert.equal(state.sessions['sess-drift'].on, true);
+    assert.equal(state.sessions['sess-other'].on, true);
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }

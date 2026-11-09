@@ -169,9 +169,10 @@ function hookTelegramDutyCommands(statePath, ctx) {
       console.log('[dsh-heartbeat] duty command hook installed:', c);
     }).catch((e) => console.warn('[dsh-heartbeat] duty hook import failed:', c, String(e)));
   }
-  setTimeout(() => {
+  const hookWarnTimer = setTimeout(() => {
     if (hooked === 0) console.warn('[dsh-heartbeat] duty command hook: no CommandRegistry instance found');
   }, 15000);
+  if (hookWarnTimer.unref) hookWarnTimer.unref();
 }
 
 async function readJsonBody(req, maxBytes = 64 * 1024) {

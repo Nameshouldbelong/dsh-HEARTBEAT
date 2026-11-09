@@ -17,6 +17,8 @@ async function startFakeSidecar(t) {
       let r;
       if (req.url === '/sessions') {
         r = { status: 200, json: { sessions: [{ key: 'dshsc-fake', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+      } else if (req.url === '/control/verify') {
+        r = { status: 200, json: { ok: true, actualPromptTokens: 100 } };
       } else if (req.url === '/control/on') {
         r = { status: 200, json: { ok: true, immediatePing: true, state: {} } };
       } else if (req.url === '/control/off') {
@@ -50,8 +52,21 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
     let webHandler = null;
     const registeredCommands = new Map();
     const effectDisposers = [];
+    const eventHandlers = new Map();
 
     const mockCtx = {
+      on(evt, fn) {
+        if (!eventHandlers.has(evt)) eventHandlers.set(evt, []);
+        eventHandlers.get(evt).push(fn);
+        return () => {
+          const list = eventHandlers.get(evt) || [];
+          const idx = list.indexOf(fn);
+          if (idx !== -1) list.splice(idx, 1);
+        };
+      },
+      emit(evt, ...args) {
+        for (const fn of eventHandlers.get(evt) || []) fn(...args);
+      },
       effect(fn) {
         const disposer = fn();
         if (typeof disposer === 'function') effectDisposers.push(disposer);
@@ -120,8 +135,9 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
     const s1 = res1.result.json.sessions.find((s) => s.sessionId === 'test-session-1');
     assert.equal(s1.title, 'PRDM2 Analysis');
 
-    // Rename 后下一次查询即同步（不缓存旧名）
+    // Rename 后通过 session/title 事件精确失效缓存并同步新名称
     titleMap.set('test-session-1', 'PRDM2 TAN Migration');
+    mockCtx.emit('session/event', { id: 'test-session-1' }, { type: 'session/title' });
     const res1b = mockRes();
     await webHandler({ method: 'GET', url: '/heartbeat/api/state' }, res1b);
     const s1b = res1b.result.json.sessions.find((s) => s.sessionId === 'test-session-1');
@@ -167,7 +183,7 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htonRes.kind, 'success');
-    assert.equal(htonRes.text, '💓 心跳已开启（间隔 60min），已立即执行首次保温');
+    assert.equal(htonRes.text, '💓 心跳已开启（窗口 50-60min，窗口内每 5s 突发至成功，前缀 100 token），已立即执行首次探测');
 
     // 5. 测试平台命令: /hto 30
     const htoCmd = registeredCommands.get('hto');
@@ -176,16 +192,16 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htoRes.kind, 'success');
-    assert.equal(htoRes.text, '💓 心跳间隔已设为 30min 并开启，已立即执行首次保温');
+    assert.equal(htoRes.text, '💓 心跳窗口已设为 20-30min 并开启（窗口内每 5s 突发至成功，前缀 100 token），已立即执行首次探测');
 
-    // 6. 测试平台命令: /hto 60 (>=60min 触发 1h TTL 告警)
+    // 6. 测试平台命令: /hto 60 (>=40min 触发缓存存活告警)
     const hto60Res = await htoCmd.handler({
       rawInput: '60',
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(hto60Res.kind, 'success');
-    assert.ok(hto60Res.text.includes('💓 心跳间隔已设为 60min 并开启'));
-    assert.ok(hto60Res.text.includes('⚠️ 间隔≥60min：1h TTL 缓存会在 ping 间过期'));
+    assert.ok(hto60Res.text.includes('💓 心跳窗口已设为 50-60min 并开启'));
+    assert.ok(hto60Res.text.includes('⚠️ 窗口右端≥40min：实测缓存存活约 28–45min，可能来不及续期'));
 
     // 7. 测试平台命令: /hto invalid (非法参数)
     const htoErrRes = await htoCmd.handler({
@@ -193,7 +209,7 @@ test('Plugin Server: apply 注册生命周期、Web API 及平台命令', async 
       agent: { session: { id: 'test-session-1' } },
     });
     assert.equal(htoErrRes.kind, 'error');
-    assert.equal(htoErrRes.text, '用法：/HTO <分钟>（1-720），如 /HTO 60');
+    assert.equal(htoErrRes.text, '用法：/HTON [起-止]（分钟，1-720，如 20-30；不带参数默认 20-30）');
 
     // 8. 测试平台命令: /htoff
     const htoffCmd = registeredCommands.get('htoff');
