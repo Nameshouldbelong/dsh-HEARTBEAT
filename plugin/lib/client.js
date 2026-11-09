@@ -123,13 +123,29 @@ const styles = `
   gap: 6px;
 }
 .hb-input {
-  width: 70px;
-  background: var(--dsh-bg-input, #111827);
-  border: 1px solid var(--dsh-border, #4b5563);
-  color: inherit;
-  padding: 4px 6px;
-  border-radius: 4px;
-  font-size: 13px;
+  width: 92px;
+  /* 2026-10-25 可读性修复：旧样式 color:inherit + 深色底，浅色主题下
+     深字压深底几乎不可读。显式给定输入框的前景/背景，双色主题都不依赖继承。 */
+  background: #ffffff;
+  color: #111827;
+  border: 1px solid #9ca3af;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  text-align: center;
+  font-weight: 600;
+}
+.hb-input:focus {
+  outline: 2px solid #3b82f6;
+  outline-offset: 1px;
+}
+@media (prefers-color-scheme: dark) {
+  .hb-input {
+    background: #1f2937;
+    color: #f9fafb;
+    border-color: #6b7280;
+  }
 }
 .hb-warning {
   color: #f59e0b;
@@ -210,7 +226,7 @@ function createHeartbeatClient(React) {
     // 不一定提供 useRef。轮询本身是"每个实例一条"，用闭包足够。
     // 每次组件实例化都新建：避免插件热重载 / 重新挂载后沿用上一实例的序号
     // （否则新实例的第一次请求会被误判为"过期响应"而丢弃）
-    const pollState = { inFlight: false, seq: 0, appliedSeq: 0, gen: 0, activeToken: 0 };
+    const pollState = { inFlight: false, gen: 0, activeToken: 0 };
 
     const fetchState = useCallback(async () => {
       // 2026-10-23 审计 U07 + U08 联合契约：
@@ -239,13 +255,20 @@ function createHeartbeatClient(React) {
           const next = { ...prev };
           for (const s of data.sessions || []) {
             if (next[s.sessionId] === undefined) {
-              next[s.sessionId] = s.intervalMin || 30;
+              const pm = (data.pings || []).find((p) => p.key === s.key);
+              const ws = pm && pm.windowStartMin != null ? pm.windowStartMin : 20;
+              const we = pm && pm.windowEndMin != null ? pm.windowEndMin : (s.intervalMin || 30);
+              next[s.sessionId] = `${ws}-${we}`;
             }
           }
           return next;
         });
       } catch (err) {
-        if (mySeq >= pollState.appliedSeq) setError(String(err));
+        // 2026-10-24 独立审计修复：旧代码此处引用了不存在的 mySeq（2026-10-23
+        // 序号→代际重构的遗留），fetch 失败时本分支抛 ReferenceError，setError
+        // 永不执行 → 错误横幅成为死代码，面板静默显示过期数据。改为与成功路径
+        // 相同的代际判断：仅当本调用仍是当前代时才更新错误状态。
+        if (myToken === pollState.activeToken) setError(String(err));
       } finally {
         if (pollState.activeToken === myToken) pollState.inFlight = false;
         setLoading(false);
@@ -265,20 +288,32 @@ function createHeartbeatClient(React) {
       return () => clearInterval(timer);
     }, [fetchState]);
 
-    const handleToggle = async (sessionId, currentlyOn, currentInterval) => {
+    // "20-30" → {s:20, e:30}；不合法返回 null
+    const parseWindowStr = (str) => {
+      const m = String(str || '').trim().match(/^(\d+)-(\d+)$/);
+      if (!m) return null;
+      const s = Number(m[1]);
+      const e = Number(m[2]);
+      if (!Number.isInteger(s) || !Number.isInteger(e) || s < 1 || e > 720 || s >= e) return null;
+      return { s, e };
+    };
+
+    const handleToggle = async (sessionId, currentlyOn) => {
       const nextOn = !currentlyOn;
       try {
+        const payload = { sessionId, on: nextOn };
+        if (nextOn) {
+          const w = parseWindowStr(inputValues[sessionId]) || { s: 20, e: 30 };
+          payload.windowStartMin = w.s;
+          payload.windowEndMin = w.e;
+        }
         const res = await fetch('/heartbeat/api/toggle', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            sessionId,
-            on: nextOn,
-            intervalMin: Number(inputValues[sessionId] || currentInterval || 30),
-          }),
+          body: JSON.stringify(payload),
         });
         // 2026-10-22 审计 §6-b：旧实现不检查 res.ok —— 服务端拒绝开启
-        // （verify 失败 / 间隔非法 / sidecar 不可达）时界面照样刷新，
+        // （verify 失败 / 窗口非法 / sidecar 不可达）时界面照样刷新，
         // 用户看不到任何原因，会误以为已开启。这正是"假健康"的入口之一。
         if (!res.ok) {
           let detail = `HTTP ${res.status}`;
@@ -298,13 +333,12 @@ function createHeartbeatClient(React) {
 
     const handleIntervalChange = (sessionId, val) => {
       setInputValues((prev) => ({ ...prev, [sessionId]: val }));
-      const num = Number(val);
-      // 2026-10-22：阈值与后端 /HTO 告警对齐（实测缓存存活 28–45min，
-      // 不是官方 1h TTL；≥40min 就很可能在两次 ping 之间过期）
-      if (num >= 40) {
+      // 窗口右端 ≥40min 与后端告警对齐（实测缓存存活 28–45min，非官方 1h TTL）
+      const w = parseWindowStr(val);
+      if (w && w.e >= 40) {
         setWarningMap((prev) => ({
           ...prev,
-          [sessionId]: '⚠️ 间隔≥40min：实测缓存存活约 28–45min，可能在 ping 之间过期',
+          [sessionId]: '⚠️ 窗口右端≥40min：实测缓存存活约 28–45min，可能在窗口开启前过期',
         }));
       } else {
         setWarningMap((prev) => {
@@ -316,16 +350,16 @@ function createHeartbeatClient(React) {
     };
 
     const handleIntervalSubmit = async (sessionId) => {
-      const val = Number(inputValues[sessionId]);
-      if (!Number.isInteger(val) || val < 1 || val > 720) {
-        alert('请输入 1-720 之间的整数分钟数');
+      const w = parseWindowStr(inputValues[sessionId]);
+      if (!w) {
+        alert('请输入保温窗口，格式如 20-30（分钟，左端≥1、右端≤720、左<右）');
         return;
       }
       try {
         const res = await fetch('/heartbeat/api/interval', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId, intervalMin: val }),
+          body: JSON.stringify({ sessionId, windowStartMin: w.s, windowEndMin: w.e }),
         });
         if (!res.ok) {
           let detail = `HTTP ${res.status}`;
@@ -333,13 +367,13 @@ function createHeartbeatClient(React) {
             const body = await res.json();
             detail = body?.error || body?.message || body?.reason || detail;
           } catch {}
-          alert('更新心跳间隔失败：' + detail);
+          alert('更新保温窗口失败：' + detail);
           await fetchState();
           return;
         }
         await fetchState();
       } catch (err) {
-        alert('更新心跳间隔失败: ' + String(err));
+        alert('更新保温窗口失败: ' + String(err));
       }
     };
 
@@ -385,7 +419,7 @@ function createHeartbeatClient(React) {
         }, loading ? '刷新中...' : '🔄 刷新状态')
       ),
       h('div', { className: 'hb-info-banner' },
-        '💡 说明：心跳仅重放该会话最后一次真实请求（max_tokens=16，输出丢弃只取遥测），零会话污染。心跳间隔合法范围 1–720 分钟（默认 50min），开启后立即执行首次保温；临时错误（429/5xx/超时）自动 +2min/+4min 快速重试。'
+        '💡 说明：心跳仅重放该会话最后一次真实请求（max_tokens=16，输出丢弃只取遥测），零会话污染。保温窗口格式 起-止（默认 20-30）：锚点后第 起 分钟开窗，窗口内每 5s 突发一次直至保温成功，右端耗尽后本周期不再尝试；429（engine 超负荷）/5xx/网络错误在窗口内自动重试。'
       ),
       error ? h('div', { style: { color: '#ef4444', marginBottom: 12 } }, '状态加载异常：' + error) : null,
       sessions.length === 0
@@ -395,7 +429,7 @@ function createHeartbeatClient(React) {
               h('tr', null,
                 h('th', null, '会话 ID / 亲和键'),
                 h('th', null, '保温状态'),
-                h('th', null, '心跳间隔'),
+                h('th', null, '保温窗口(min)'),
                 h('th', null, '开关操作'),
                 h('th', null, '上次心跳 / 遥测')
               )
@@ -421,9 +455,15 @@ function createHeartbeatClient(React) {
                   } else if (isWaiting || health === 'waiting') {
                     badgeClass = 'hb-badge-waiting';
                     badgeText = '🔵 WAITING FOR REAL REQUEST';
+                  } else if (health === 'bursting') {
+                    badgeClass = 'hb-badge-retrying';
+                    badgeText = `🟠 BURSTING (窗口内 5s 突发 #${ping?.burst?.attempts || 0})`;
                   } else if (health === 'retrying') {
                     badgeClass = 'hb-badge-retrying';
-                    badgeText = `🟠 RETRYING (#${ping?.retryCount || 1})`;
+                    badgeText = `🟠 RETRYING (429/5xx 窗口内自动重试)`;
+                  } else if (health === 'window-expired') {
+                    badgeClass = 'hb-badge-stale';
+                    badgeText = '🟡 WINDOW-EXPIRED (本周期未成功，等下一窗口)';
                   } else if (health === 'hit') {
                     badgeClass = 'hb-badge-on';
                     badgeText = '🟢 ACTIVE · HIT';
@@ -444,9 +484,12 @@ function createHeartbeatClient(React) {
                   }
                 }
 
-                const currentVal = inputValues[s.sessionId] !== undefined ? inputValues[s.sessionId] : (s.intervalMin || 30);
+                const pm = pingsMap.get(s.key);
+                const currentVal = inputValues[s.sessionId] !== undefined ? inputValues[s.sessionId]
+                  : `${pm && pm.windowStartMin != null ? pm.windowStartMin : 20}-${pm && pm.windowEndMin != null ? pm.windowEndMin : (s.intervalMin || 30)}`;
                 // 2026-10-23 审计 U04：告警阈值必须与后端一致（实测缓存活 28–45min）
-                const warnText = warningMap[s.sessionId] || (Number(currentVal) >= 40 ? '⚠️ 间隔≥40min：实测缓存存活约 28–45min，可能在 ping 之间过期' : null);
+                const cw = parseWindowStr(currentVal);
+                const warnText = warningMap[s.sessionId] || (cw && cw.e >= 40 ? '⚠️ 窗口右端≥40min：实测缓存存活约 28–45min，可能在窗口开启前过期' : null);
 
                 return h('tr', { key: s.sessionId },
                   h('td', null,
@@ -460,16 +503,18 @@ function createHeartbeatClient(React) {
                     h('div', { className: 'hb-interval-wrap' },
                       h('div', { className: 'hb-interval-row' },
                         h('input', {
-                          type: 'number',
-                          min: 1,
-                          max: 720,
+                          type: 'text',
+                          inputMode: 'numeric',
+                          pattern: '\\d+-\\d+',
+                          placeholder: '20-30',
+                          title: '保温窗口（分钟），如 20-30',
                           className: 'hb-input',
                           value: currentVal,
                           onChange: (e) => handleIntervalChange(s.sessionId, e.target.value),
                           onBlur: () => handleIntervalSubmit(s.sessionId),
                           onKeyDown: (e) => { if (e.key === 'Enter') handleIntervalSubmit(s.sessionId); },
                         }),
-                        h('span', null, '分钟')
+                        h('span', null, 'min')
                       ),
                       warnText ? h('div', { className: 'hb-warning' }, warnText) : null
                     )
@@ -480,7 +525,7 @@ function createHeartbeatClient(React) {
                       className: `hb-btn-toggle ${isOn ? 'hb-btn-turn-off' : 'hb-btn-turn-on'}`,
                       disabled: !s.key,
                       title: !s.key ? '此会话暂无缓存活动：先对话一轮再开启' : '',
-                      onClick: () => handleToggle(s.sessionId, isOn, s.intervalMin),
+                      onClick: () => handleToggle(s.sessionId, isOn),
                     }, !s.key ? '未激活 (无缓存)' : (isOn ? '关闭心跳 (OFF)' : '开启心跳 (ON)'))
                   ),
                   h('td', null,
@@ -518,7 +563,101 @@ function createHeartbeatClient(React) {
     );
   }
 
-  return { HeartbeatTabView };
+  // ── TOOL GATE tab（2026-10-24）───────────────────────────────────────────
+  // 背景：全局挂载的 rea MCP（207 工具/652KB schema）触发 Kimi /coding 的
+  // "schema exceeds maximum allowed size" 400。dsh 的 MCP 注册无热切换，
+  // 故由 sidecar 在 kimi 出站按前缀剥除；本面板是它的开关（经插件代理，
+  // 不直连 sidecar）。轮询沿用 U07 单在途契约。
+  function ToolGateTabView(props) {
+    const [gate, setGate] = useState(null);
+    const [error, setError] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const poll = { inFlight: false };
+
+    const fetchGate = useCallback(async () => {
+      if (poll.inFlight) return;
+      poll.inFlight = true;
+      try {
+        const res = await fetch('/heartbeat/api/toolgate');
+        if (!res.ok) {
+          throw new Error(res.status === 503 ? 'sidecar 不可达或为旧版（无 /control/toolgate）' : `HTTP ${res.status}`);
+        }
+        setGate(await res.json());
+        setError(null);
+      } catch (err) {
+        setError(String(err && err.message ? err.message : err));
+      } finally {
+        poll.inFlight = false;
+      }
+    }, []);
+
+    useEffect(() => {
+      void fetchGate();
+      const timer = setInterval(() => { void fetchGate(); }, 5000);
+      return () => clearInterval(timer);
+    }, [fetchGate]);
+
+    const toggle = async () => {
+      if (!gate || busy) return;
+      setBusy(true);
+      try {
+        const res = await fetch('/heartbeat/api/toolgate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: !gate.enabled }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        setGate(data);
+        setError(null);
+      } catch (err) {
+        setError(String(err && err.message ? err.message : err));
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const kb = (n) => (Number(n) / 1024).toFixed(1) + ' KB';
+    return h('div', { className: 'hb-container' },
+      h('div', { className: 'hb-header' },
+        h('div', null,
+          h('h3', { className: 'hb-title' }, '🚪 TOOL GATE'),
+          h('div', { className: 'hb-subtitle' },
+            'kimi 出站工具门控：按前缀剥除超限 MCP 工具，即时生效、零重启；其他 provider 直连不经 sidecar，不受影响')
+        ),
+        h('button', { type: 'button', className: 'hb-refresh-btn', onClick: () => { void fetchGate(); } }, '刷新')
+      ),
+      error
+        ? h('div', { className: 'hb-info-banner', style: { borderColor: 'rgba(239,68,68,.4)', background: 'rgba(239,68,68,.08)' } }, '⚠️ ' + error)
+        : null,
+      gate
+        ? h('div', null,
+            h('div', { className: 'hb-info-banner' },
+              h('div', null, h('strong', null, '状态：' + (gate.enabled ? '开启（按前缀剥除中）' : '关闭（原样透传）'))),
+              h('div', { className: 'hb-mono', style: { marginTop: 6 } }, '剥除前缀：' + (gate.dropPrefixes || []).join(', ')),
+              gate.stats
+                ? h('div', { className: 'hb-mono', style: { marginTop: 4 } },
+                    `累计：${gate.stats.gatedRequests} 次请求 | 剥除 ${gate.stats.strippedTools} 个工具 | 节省 ${kb(gate.stats.savedBytes)}` +
+                    (gate.stats.lastAt ? ` | 最近：${new Date(gate.stats.lastAt).toLocaleTimeString()}` : ''))
+                : null
+            ),
+            h('div', null,
+              h('button', {
+                type: 'button',
+                className: `hb-btn-toggle ${gate.enabled ? 'hb-btn-turn-off' : 'hb-btn-turn-on'}`,
+                disabled: busy,
+                onClick: () => { void toggle(); },
+              }, busy ? '…' : (gate.enabled ? '关闭门控 (OFF)' : '开启门控 (ON)')),
+              gate.enabled
+                ? h('span', { className: 'hb-mono', style: { marginLeft: 10 } }, '开启时：kimi 会话的模型看不到被剥除的工具')
+                : h('span', { className: 'hb-mono', style: { marginLeft: 10, color: '#f59e0b' } }, '⚠️ 关闭期间：带超限 schema 的 kimi 请求将被 Kimi 400')
+            )
+          )
+        : (!error ? h('div', { className: 'hb-empty' }, '加载中…') : null)
+    );
+  }
+
+  return { HeartbeatTabView, ToolGateTabView };
 }
 
 const inject = ['slots'];
@@ -535,7 +674,7 @@ function apply(ctx) {
     return;
   }
 
-  const { HeartbeatTabView } = createHeartbeatClient(React);
+  const { HeartbeatTabView, ToolGateTabView } = createHeartbeatClient(React);
 
   // 注入样式
   ctx.effect(() => {
@@ -558,6 +697,16 @@ function apply(ctx) {
       label: () => 'HEARTBEAT',
     }, (props) => React.createElement(HeartbeatTabView, props))
   );
+
+  // 注册顶部栏 TOOL GATE tab（order 106，紧随 HEARTBEAT）
+  ctx.slots.inject('conversation.view', () =>
+    ctx.slots.register({
+      name: 'conversation.view',
+      id: 'toolgate',
+      order: 106,
+      label: () => 'TOOL GATE',
+    }, (props) => React.createElement(ToolGateTabView, props))
+  );
 }
 
 // 兼容 DSH ModuleLoader 与 ESM
@@ -565,7 +714,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
   const factory = (require) => {
     const module = { exports: {} };
     const React = require('react');
-    const { HeartbeatTabView } = createHeartbeatClient(React);
+    const { HeartbeatTabView, ToolGateTabView } = createHeartbeatClient(React);
 
     module.exports = {
       inject: ['slots'],
@@ -588,6 +737,15 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
             order: 105,
             label: () => 'HEARTBEAT',
           }, (props) => React.createElement(HeartbeatTabView, props))
+        );
+
+        ctx.slots.inject('conversation.view', () =>
+          ctx.slots.register({
+            name: 'conversation.view',
+            id: 'toolgate',
+            order: 106,
+            label: () => 'TOOL GATE',
+          }, (props) => React.createElement(ToolGateTabView, props))
         );
       },
     };

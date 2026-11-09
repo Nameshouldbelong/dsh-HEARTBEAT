@@ -76,18 +76,26 @@ export async function sidecarSelfCheck() {
 }
 
 /**
- * 开启保温（2026-10-23 审计第一批第 1 条：ensure / resume 分离）。
+ * 开启保温（2026-10-25 区间突发版：窗口 [startMin, endMin]，窗口内每 5s 突发至成功）。
  *
  * @param {'ensure'|'resume'} action
  *   'resume' = 用户显式开启，可解除可恢复熔断（低命中 / 403）。
  *   'ensure' = 自动对账补挂，**不得**解除熔断；熔断中返回 409 breaker-open。
- * 旧调用方不传 action 时按 'resume' 处理（保持向后兼容）。
+ * 旧调用方不传窗口时默认 20-30；旧调用方传 intervalMin 数字时映射为 [N-10, N]。
  */
-export async function sidecarControlOn(key, intervalMin = 30, action = 'resume') {
+export async function sidecarControlOn(key, windowStartMin = 20, windowEndMin = 30, action = 'resume') {
+  const payload = { key, action };
+  if (typeof windowStartMin === 'number' && typeof windowEndMin === 'number') {
+    payload.windowStartMin = windowStartMin;
+    payload.windowEndMin = windowEndMin;
+  } else if (typeof windowStartMin === 'number') {
+    payload.intervalMin = windowStartMin; // 兼容旧签名 (key, intervalMin, action)
+    if (typeof windowEndMin === 'string') payload.action = windowEndMin;
+  }
   return sidecarRequest('/control/on', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ key, intervalMin, action }),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -107,5 +115,21 @@ export async function sidecarVerify({ key, sessionId, expectedPromptTokens, tole
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ key, sessionId, expectedPromptTokens, tolerance }),
     timeout: 5000,
+  });
+}
+
+// 工具门控（2026-10-24）：读取/设置 kimi 出站的工具剥除开关。
+// 返回 null 表示 sidecar 不可达或旧版无该端点（面板显示"不可用"而不是猜状态）。
+export async function sidecarToolGateGet() {
+  const res = await sidecarRequest('/control/toolgate');
+  if (res.status === 200 && res.data && typeof res.data === 'object') return res.data;
+  return null;
+}
+
+export async function sidecarToolGateSet(payload) {
+  return sidecarRequest('/control/toolgate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
   });
 }

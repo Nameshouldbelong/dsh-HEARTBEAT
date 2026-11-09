@@ -5,8 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { getDefaultStatePath, readState } from './state.mjs';
-import { sidecarControlState, sidecarSessions, sidecarSelfCheck } from './sidecar-client.mjs';
-import { parseHtoParam, executeHton, executeHtoff, executeHto } from './commands.mjs';
+import { sidecarControlState, sidecarSessions, sidecarSelfCheck, sidecarToolGateGet, sidecarToolGateSet } from './sidecar-client.mjs';
+import { parseHtoParam, executeHton, executeHtoff, executeHto, executeTgon, executeTgoff, executeTgstatus, windowOfSession } from './commands.mjs';
 import { getAllSessionIds, getArchivedIds, startReconciler } from './reconciler.mjs';
 import { sessionKeyFor } from './keys.mjs';
 
@@ -124,7 +124,8 @@ function hookTelegramDutyCommands(statePath, ctx) {
             name: 'hton', aliases: ['HTON'],
             handler: async (args, env) => {
               const targetSessionId = env?.targetSessionId || 'telegram-duty';
-              return await executeHton(targetSessionId, statePath);
+              // 2026-10-25：/HTON 可携带区间参数（如 15-20），空则默认 20-30
+              return await executeHton(targetSessionId, statePath, { windowArg: args });
             },
           };
         }
@@ -144,6 +145,13 @@ function hookTelegramDutyCommands(statePath, ctx) {
               const targetSessionId = env?.targetSessionId || 'telegram-duty';
               return await executeHto(args, targetSessionId, statePath);
             },
+          };
+        }
+        if (lower === 'tgon' || lower === 'tgoff' || lower === 'tg') {
+          const fn = lower === 'tgon' ? executeTgon : (lower === 'tgoff' ? executeTgoff : executeTgstatus);
+          return {
+            name: lower, aliases: [lower.toUpperCase()],
+            handler: async () => await fn(),
           };
         }
         return origResolve.call(this, cmdName);
@@ -253,10 +261,11 @@ export function apply(ctx) {
   const registerCommands = (cmdCtx) => {
     cmdCtx.commands.register({
       name: 'hton',
-      description: '开启当前会话心跳保温',
+      description: '开启当前会话心跳保温（可带窗口如 20-30，默认 20-30）',
+      input: { hint: '[起-止] 如 20-30' },
       handler: async (invocation) => {
         const targetSessionId = invocation?.agent?.session?.id || getDutyTargetSessionId(ctx);
-        const text = await executeHton(targetSessionId, statePath);
+        const text = await executeHton(targetSessionId, statePath, { windowArg: invocation.rawInput });
         return { kind: 'success', text };
       },
     });
@@ -286,14 +295,35 @@ export function apply(ctx) {
       },
     });
 
+    // 工具门控（2026-10-24）：kimi 出站按前缀剥除 MCP 工具（rea 652KB schema 事故）
+    const registerToolGateCommands = (c) => {
+      c.commands.register({
+        name: 'tgon',
+        description: '开启工具门控（kimi 出站按前缀剥除工具，即时生效）',
+        handler: async () => ({ kind: 'success', text: await executeTgon() }),
+      });
+      c.commands.register({
+        name: 'tgoff',
+        description: '关闭工具门控（kimi 出站原样透传）',
+        handler: async () => ({ kind: 'success', text: await executeTgoff() }),
+      });
+      c.commands.register({
+        name: 'tg',
+        description: '查看工具门控状态与累计统计',
+        handler: async () => ({ kind: 'success', text: await executeTgstatus() }),
+      });
+    };
+    registerToolGateCommands(cmdCtx);
+
     // 兼容大写命令
     try {
       cmdCtx.commands.register({
         name: 'HTON',
-        description: '开启当前会话心跳保温',
+        description: '开启当前会话心跳保温（可带窗口如 20-30，默认 20-30）',
+        input: { hint: '[起-止] 如 20-30' },
         handler: async (invocation) => {
           const targetSessionId = invocation?.agent?.session?.id || getDutyTargetSessionId(ctx);
-          const text = await executeHton(targetSessionId, statePath);
+          const text = await executeHton(targetSessionId, statePath, { windowArg: invocation.rawInput });
           return { kind: 'success', text };
         },
       });
@@ -364,6 +394,8 @@ export function apply(ctx) {
               on: s.on === true,
               waiting: s.waiting === true,
               intervalMin: s.intervalMin || 30,
+              windowStartMin: s.windowStartMin != null ? s.windowStartMin : (windowOfSession(s).startMin),
+              windowEndMin: s.windowEndMin != null ? s.windowEndMin : (windowOfSession(s).endMin),
               updatedAt: s.updatedAt,
               verifyError: s.verifyError || null,
             });
@@ -381,6 +413,8 @@ export function apply(ctx) {
                 on: false,
                 waiting: false,
                 intervalMin: 30,
+                windowStartMin: 20,
+                windowEndMin: 30,
               });
             }
           }
@@ -417,7 +451,7 @@ export function apply(ctx) {
                 code: 'state-diverged',
                 severity: sidecarOn ? 'warn' : 'error',
                 detail: sidecarOn
-                  ? `插件记录为关闭，但 sidecar 仍在保温该会话（间隔 ${sp.intervalMin}min）。`
+                  ? `插件记录为关闭，但 sidecar 仍在保温该会话（窗口 ${sp.windowStartMin ?? 20}-${sp.windowEndMin ?? 30}min）。`
                     + '说明 sidecar 侧被单独开启过（例如手工调用 /control/on）——插件不会管理它，'
                     + '重启插件或删除 state.json 条目后仍会残留。建议在面板点「关闭」再重新开启。'
                   : '插件记录为开启，但 sidecar 侧已无对应的保温记录：实际没有在 ping。'
@@ -439,25 +473,28 @@ export function apply(ctx) {
 
         if (req.method === 'POST' && pathname === '/heartbeat/api/toggle') {
           const body = await readJsonBody(req);
-          const { sessionId, on, intervalMin } = body || {};
+          const { sessionId, on } = body || {};
           if (!sessionId) {
             sendJson(res, 400, { error: 'missing sessionId' });
             return;
           }
+          // 保温窗口：优先 windowStartMin/windowEndMin；兼容旧 intervalMin（N→[N-10,N]）
+          let windowArg;
+          if (body.windowStartMin !== undefined && body.windowEndMin !== undefined) {
+            windowArg = `${body.windowStartMin}-${body.windowEndMin}`;
+          } else if (body.intervalMin !== undefined) {
+            windowArg = String(body.intervalMin);
+          }
+          if (windowArg !== undefined) {
+            const parsed = parseHtoParam(windowArg);
+            if (!parsed.valid) {
+              sendJson(res, 400, { error: '非法保温窗口：' + (parsed.error || windowArg) });
+              return;
+            }
+          }
           let text;
           if (on) {
-            // 2026-10-22 审计 §6-b：必须先**校验区间**再执行任何副作用。
-            // 旧实现先 executeHto（非法间隔只返回一句错误文本、不落盘）紧接着
-            // executeHton —— 于是"间隔非法"被后续成功开启掩盖，用户以为生效了。
-            if (intervalMin !== undefined) {
-              const parsed = parseHtoParam(String(intervalMin));
-              if (!parsed.valid) {
-                sendJson(res, 400, { error: '非法间隔：' + (parsed.error || String(intervalMin)) });
-                return;
-              }
-              await executeHto(String(intervalMin), sessionId, statePath);
-            }
-            text = await executeHton(sessionId, statePath);
+            text = await executeHton(sessionId, statePath, { windowArg });
             // 开启被拒（verify 不通过 / sidecar 不可达）时如实回报，不返回 200
             const after = readState(statePath).sessions[sessionId];
             if (!after || after.on !== true) {
@@ -478,29 +515,62 @@ export function apply(ctx) {
 
         if (req.method === 'POST' && pathname === '/heartbeat/api/interval') {
           const body = await readJsonBody(req);
-          const { sessionId, intervalMin } = body || {};
-          if (!sessionId || intervalMin === undefined) {
-            sendJson(res, 400, { error: 'missing sessionId or intervalMin' });
+          const { sessionId } = body || {};
+          if (!sessionId) {
+            sendJson(res, 400, { error: 'missing sessionId' });
+            return;
+          }
+          // 窗口参数：windowStartMin/windowEndMin（或旧 intervalMin）→ 组装为 "s-e"
+          let windowArg;
+          if (body.windowStartMin !== undefined && body.windowEndMin !== undefined) {
+            windowArg = `${body.windowStartMin}-${body.windowEndMin}`;
+          } else if (body.intervalMin !== undefined) {
+            windowArg = String(body.intervalMin);
+          }
+          if (windowArg === undefined) {
+            sendJson(res, 400, { error: 'missing window (windowStartMin/windowEndMin)' });
             return;
           }
           // 2026-10-23 审计 T25：先校验参数，再执行副作用
-          const parsed = parseHtoParam(String(intervalMin));
+          const parsed = parseHtoParam(windowArg);
           if (!parsed.valid) {
-            sendJson(res, 400, { error: parsed.error || 'invalid interval' });
+            sendJson(res, 400, { error: parsed.error || 'invalid window' });
             return;
           }
-          const text = await executeHto(String(intervalMin), sessionId, statePath);
+          const text = await executeHto(windowArg, sessionId, statePath);
           const updated = readState(statePath).sessions[sessionId];
           // 身份校验失败（verify 拒绝）必须报 HTTP 失败，不能 200 + ok:true
           if (!updated || updated.on !== true) {
             sendJson(res, 409, {
-              error: (updated && updated.verifyError) || 'interval 已拒绝',
+              error: (updated && updated.verifyError) || 'window 已拒绝',
               text,
               session: updated,
             });
             return;
           }
           sendJson(res, 200, { ok: true, text, session: updated });
+          return;
+        }
+
+        // 工具门控（2026-10-24）：插件代理 sidecar 的 /control/toolgate，
+        // 供 TOOL GATE tab 使用。sidecar 不可达/旧版时如实 503，不猜状态。
+        if (pathname === '/heartbeat/api/toolgate' && req.method === 'GET') {
+          const g = await sidecarToolGateGet();
+          if (!g) {
+            sendJson(res, 503, { error: 'sidecar-unreachable-or-legacy' });
+            return;
+          }
+          sendJson(res, 200, g);
+          return;
+        }
+        if (pathname === '/heartbeat/api/toolgate' && req.method === 'POST') {
+          const body = await readJsonBody(req);
+          const res2 = await sidecarToolGateSet(body || {});
+          if (!res2 || res2.status !== 200) {
+            sendJson(res, (res2 && res2.status) || 503, (res2 && res2.data) || { error: 'sidecar-unreachable' });
+            return;
+          }
+          sendJson(res, 200, res2.data);
           return;
         }
 
