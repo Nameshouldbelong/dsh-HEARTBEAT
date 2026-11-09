@@ -184,6 +184,9 @@ test('Visibility ③: 取消归档后再次查询重现（模拟 archivedSession
     assert.ok(ids1.includes('sess-static'));
     assert.ok(!ids1.includes('sess-dynamic'), '初始处于归档状态，不应出现');
 
+    // 等待启动时的首轮 reconciler 完成对归档会话的置 OFF 与清理（Contract-D: archived 会话清理）
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
     // 模拟用户在 DSH GUI 中取消归档（动态解除归档）
     archivedList.length = 0;
 

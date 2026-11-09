@@ -135,8 +135,9 @@ export async function executeHton(sessionId, statePath, opts = {}) {
   const state = readState(statePath);
   const current = state.sessions[sessionId];
   const fallback = windowOfSession(current);
-  const parsed = parseHtoParam(opts.windowArg);
-  const win = parsed.valid ? parsed : fallback;
+  const hasArg = typeof opts.windowArg === 'string' && opts.windowArg.trim() !== '';
+  const parsed = hasArg ? parseHtoParam(opts.windowArg) : fallback;
+  const win = parsed.valid !== false ? parsed : fallback;
   const { startMin, endMin } = win;
   const key = resolveSessionKey(sessionId);
 
@@ -216,6 +217,22 @@ export async function executeHto(arg, sessionId, statePath, opts = {}) {
 
   const expected = await resolveExpectedPromptTokens(sessionId, key, opts.expectedPromptTokens);
   const check = await verifyBinding(sessionId, key, { expectedPromptTokens: expected });
+  if (!check.ok && check.reason === 'no-request-recorded') {
+    const res = await sidecarControlOn(key, startMin, endMin, 'resume').catch(() => null);
+    const waiting = res != null && res.status === 409;
+    updateSessionState(statePath, sessionId, {
+      key,
+      on: true,
+      windowStartMin: startMin,
+      windowEndMin: endMin,
+      intervalMin: endMin,
+      waiting,
+    });
+    if (res == null) {
+      return `⚠️ sidecar 未响应（已记录开启意图，reconciler 会补挂）`;
+    }
+    return `⏳ 已登记等待：该会话下一次真实请求到达后自动开始保温（窗口 ${startMin}-${endMin}min）`;
+  }
   if (!check.ok) {
     updateSessionState(statePath, sessionId, { key, on: false, waiting: false });
     return check.text;

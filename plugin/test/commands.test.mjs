@@ -6,6 +6,7 @@ import os from 'node:os';
 import http from 'node:http';
 import { parseHtoParam, executeHton, executeHtoff, executeHto } from '../lib/commands.mjs';
 import { readState } from '../lib/state.mjs';
+import { sessionKeyFor } from '../lib/keys.mjs';
 
 // 确定性 fake sidecar（不依赖本机真实 sidecar 8791）
 async function startFakeSidecar(t, behavior) {
@@ -31,42 +32,60 @@ const defaultBehavior = (url) => {
   if (url === '/sessions') {
     return { status: 200, json: { sessions: [{ key: 'dshsc-cmdtest', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
   }
+  if (url === '/control/verify') {
+    return { status: 200, json: { ok: true, actualPromptTokens: 100 } };
+  }
   if (url === '/control/on') return { status: 200, json: { ok: true, immediatePing: true, state: {} } };
   if (url === '/control/off') return { status: 200, json: { ok: true } };
   return { status: 404, json: {} };
 };
 
 test('Contract-E: parseHtoParam 参数解析', () => {
-  const usage = '用法：/HTO <分钟>（1-720），如 /HTO 60';
+  const usage = '用法：/HTON [起-止]（分钟，1-720，如 20-30；不带参数默认 20-30）';
 
-  // 1. 合法整数 (1–720)
-  assert.deepEqual(parseHtoParam('1'), { valid: true, minutes: 1 });
-  assert.deepEqual(parseHtoParam('50'), { valid: true, minutes: 50 });
-  assert.deepEqual(parseHtoParam('60'), { valid: true, minutes: 60 });
-  assert.deepEqual(parseHtoParam('720'), { valid: true, minutes: 720 });
+  // 1. 默认值与空输入（缺省 20-30）
+  assert.deepEqual(parseHtoParam(''), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam('   '), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam(null), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam(undefined), { valid: true, startMin: 20, endMin: 30 });
 
-  // 2. 含空格（前导、后置、多重空格）
-  assert.deepEqual(parseHtoParam('  60'), { valid: true, minutes: 60 });
-  assert.deepEqual(parseHtoParam('60  '), { valid: true, minutes: 60 });
-  assert.deepEqual(parseHtoParam('   50   '), { valid: true, minutes: 50 });
-  assert.deepEqual(parseHtoParam('  720  '), { valid: true, minutes: 720 });
+  // 2. 窗口区间输入（起-止，1-720，s < e）
+  assert.deepEqual(parseHtoParam('20-30'), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam('1-50'), { valid: true, startMin: 1, endMin: 50 });
+  assert.deepEqual(parseHtoParam('10-60'), { valid: true, startMin: 10, endMin: 60 });
+  assert.deepEqual(parseHtoParam('1-720'), { valid: true, startMin: 1, endMin: 720 });
 
-  // 3. 越界 (0, 721, 负数, 超大数字)
+  // 3. 旧单值兼容输入（11-720，自动映射 [max(1, n-10), n]）
+  assert.deepEqual(parseHtoParam('50'), { valid: true, startMin: 40, endMin: 50 });
+  assert.deepEqual(parseHtoParam('60'), { valid: true, startMin: 50, endMin: 60 });
+  assert.deepEqual(parseHtoParam('720'), { valid: true, startMin: 710, endMin: 720 });
+  assert.deepEqual(parseHtoParam('11'), { valid: true, startMin: 1, endMin: 11 });
+
+  // 4. 含空格（前导、后置、多重空格）
+  assert.deepEqual(parseHtoParam('  20-30  '), { valid: true, startMin: 20, endMin: 30 });
+  assert.deepEqual(parseHtoParam('  60'), { valid: true, startMin: 50, endMin: 60 });
+  assert.deepEqual(parseHtoParam('60  '), { valid: true, startMin: 50, endMin: 60 });
+  assert.deepEqual(parseHtoParam('   50   '), { valid: true, startMin: 40, endMin: 50 });
+  assert.deepEqual(parseHtoParam('  720  '), { valid: true, startMin: 710, endMin: 720 });
+
+  // 5. 越界与非法区间 (0, 721, 负数, 超大数字, 单值 < 11, 起 >= 止)
   assert.deepEqual(parseHtoParam('0'), { valid: false, error: usage });
+  assert.deepEqual(parseHtoParam('1'), { valid: false, error: usage });
+  assert.deepEqual(parseHtoParam('10'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('721'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('-1'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('-50'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('1000'), { valid: false, error: usage });
+  assert.deepEqual(parseHtoParam('30-20'), { valid: false, error: usage });
+  assert.deepEqual(parseHtoParam('20-20'), { valid: false, error: usage });
+  assert.deepEqual(parseHtoParam('0-30'), { valid: false, error: usage });
+  assert.deepEqual(parseHtoParam('10-721'), { valid: false, error: usage });
 
-  // 4. 非数字 / 异常输入
+  // 6. 非数字 / 异常输入
   assert.deepEqual(parseHtoParam('abc'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('60min'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('50.5'), { valid: false, error: usage });
   assert.deepEqual(parseHtoParam('50 30'), { valid: false, error: usage });
-  assert.deepEqual(parseHtoParam(''), { valid: false, error: usage });
-  assert.deepEqual(parseHtoParam('   '), { valid: false, error: usage });
-  assert.deepEqual(parseHtoParam(null), { valid: false, error: usage });
-  assert.deepEqual(parseHtoParam(undefined), { valid: false, error: usage });
 });
 
 test('Contract-E: /HTON, /HTOFF, /HTO 回执与状态变更', async (t) => {
@@ -76,11 +95,13 @@ test('Contract-E: /HTON, /HTOFF, /HTO 回执与状态变更', async (t) => {
   try {
     const sessionId = 'test-duty-session-1';
 
-    // 1. /HTON 开启（默认 50min），开启即立即执行首次保温
+    // 1. /HTON 开启（默认 20-30min 窗口），开启即立即执行首次探测
     const r1 = await executeHton(sessionId, tmpFile);
-    assert.equal(r1, '💓 心跳已开启（间隔 30min），已立即执行首次保温');
+    assert.equal(r1, '💓 心跳已开启（窗口 20-30min，窗口内每 5s 突发至成功，前缀 100 token），已立即执行首次探测');
     let state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].on, true);
+    assert.equal(state.sessions[sessionId].windowStartMin, 20);
+    assert.equal(state.sessions[sessionId].windowEndMin, 30);
     assert.equal(state.sessions[sessionId].intervalMin, 30);
     assert.equal(state.sessions[sessionId].waiting, false);
 
@@ -90,37 +111,40 @@ test('Contract-E: /HTON, /HTOFF, /HTO 回执与状态变更', async (t) => {
     state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].on, false);
 
-    // 3. /HTO 30 设间隔并开启 (<60min 无告警)
+    // 3. /HTO 30 设窗口并开启 (<40min 无 TTL 告警)
     const r3 = await executeHto('30', sessionId, tmpFile);
-    assert.equal(r3, '💓 心跳间隔已设为 30min 并开启，已立即执行首次保温');
+    assert.equal(r3, '💓 心跳窗口已设为 20-30min 并开启（窗口内每 5s 突发至成功，前缀 100 token），已立即执行首次探测');
     state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].on, true);
-    assert.equal(state.sessions[sessionId].intervalMin, 30);
+    assert.equal(state.sessions[sessionId].windowStartMin, 20);
+    assert.equal(state.sessions[sessionId].windowEndMin, 30);
 
-    // 4. /HTO 60 设间隔并开启 (>=60min 触发 1h TTL 告警)
+    // 4. /HTO 60 设窗口并开启 (>=40min 触发缓存存活告警)
     const r4 = await executeHto('60', sessionId, tmpFile);
-    assert.ok(r4.includes('💓 心跳间隔已设为 60min 并开启'));
-    assert.ok(r4.includes('⚠️ 间隔≥60min：1h TTL 缓存会在 ping 间过期'));
+    assert.ok(r4.includes('💓 心跳窗口已设为 50-60min 并开启'));
+    assert.ok(r4.includes('⚠️ 窗口右端≥40min：实测缓存存活约 28–45min，可能来不及续期'));
     state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].on, true);
-    assert.equal(state.sessions[sessionId].intervalMin, 60);
+    assert.equal(state.sessions[sessionId].windowStartMin, 50);
+    assert.equal(state.sessions[sessionId].windowEndMin, 60);
 
     // 5. /HTO 含空格参数 '  45  '
     const r5 = await executeHto('  45  ', sessionId, tmpFile);
-    assert.equal(r5, '💓 心跳间隔已设为 45min 并开启，已立即执行首次保温');
+    assert.ok(r5.includes('💓 心跳窗口已设为 35-45min 并开启'));
     state = readState(tmpFile);
-    assert.equal(state.sessions[sessionId].intervalMin, 45);
+    assert.equal(state.sessions[sessionId].windowStartMin, 35);
+    assert.equal(state.sessions[sessionId].windowEndMin, 45);
 
     // 6. /HTO 错误参数 -> 不变更状态，返回用法提示
     const r6 = await executeHto('invalid', sessionId, tmpFile);
-    assert.equal(r6, '用法：/HTO <分钟>（1-720），如 /HTO 60');
+    assert.equal(r6, '用法：/HTON [起-止]（分钟，1-720，如 20-30；不带参数默认 20-30）');
     state = readState(tmpFile);
     // 状态保持上一次的 45
-    assert.equal(state.sessions[sessionId].intervalMin, 45);
+    assert.equal(state.sessions[sessionId].windowEndMin, 45);
 
-    // 7. /HTON 沿用现有间隔（上一步设的 45min）
+    // 7. /HTON 沿用现有窗口（上一步设的 35-45min）
     const r7 = await executeHton(sessionId, tmpFile);
-    assert.equal(r7, '💓 心跳已开启（间隔 45min），已立即执行首次保温');
+    assert.equal(r7, '💓 心跳已开启（窗口 35-45min，窗口内每 5s 突发至成功，前缀 100 token），已立即执行首次探测');
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }
@@ -132,6 +156,9 @@ test('第八章: sidecar 409 no-request-recorded -> waiting 意图而非假 ACTI
     if (url === '/sessions') {
       return { status: 200, json: { sessions: [{ key: 'dshsc-waiting', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
     }
+    if (url === '/control/verify') {
+      return { status: 200, json: { ok: false, reasons: ['no-request-recorded'] } };
+    }
     if (url === '/control/on') return { status: 409, json: { error: 'no-request-recorded', waiting: true } };
     if (url === '/control/off') return { status: 200, json: { ok: true } };
     return { status: 404, json: {} };
@@ -140,15 +167,14 @@ test('第八章: sidecar 409 no-request-recorded -> waiting 意图而非假 ACTI
   try {
     const sessionId = 'test-duty-waiting';
     const r1 = await executeHton(sessionId, tmpFile);
-    assert.ok(r1.includes('心跳意图已记录'), '409 时回执应说明等待真实请求: ' + r1);
-    assert.ok(r1.includes('下一次真实请求'));
+    assert.ok(r1.includes('已登记等待') && r1.includes('下一次真实请求'), '409 时回执应说明等待真实请求: ' + r1);
     let state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].on, true);
     assert.equal(state.sessions[sessionId].waiting, true, 'state 应标记 waiting，UI 显示 WAITING FOR REAL REQUEST');
 
     // /HTO 同样识别 409
     const r2 = await executeHto('50', sessionId, tmpFile);
-    assert.ok(r2.includes('下一次真实请求'), r2);
+    assert.ok(r2.includes('已登记等待') && r2.includes('下一次真实请求'), r2);
     state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].waiting, true);
   } finally {
@@ -156,37 +182,43 @@ test('第八章: sidecar 409 no-request-recorded -> waiting 意图而非假 ACTI
   }
 });
 
-test('第八章: sidecar 不可达 -> 诚实回执 + 保留开启意图', async (t) => {
+test('第八章: sidecar 不可达 -> 诚实回执，拒绝开启（不假装 ACTIVE）', async (t) => {
   const tmpFile = path.join(os.tmpdir(), `dsh-cmd-down-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
   process.env.SIDECAR_PORT = '19999'; // 未监听端口
   t.after(() => delete process.env.SIDECAR_PORT);
 
   try {
     const sessionId = 'test-duty-down';
-    // sidecar 不可达时 /sessions 返回 [] -> resolveSessionKey 依赖 state 里已有 key
-    // 先种入 key（模拟此前成功开启过）
     const { updateSessionState } = await import('../lib/state.mjs');
     updateSessionState(tmpFile, sessionId, { key: 'dshsc-down', on: false, intervalMin: 30 });
 
     const r1 = await executeHton(sessionId, tmpFile);
-    assert.ok(r1.includes('sidecar 未响应'), r1);
+    assert.ok(r1.includes('sidecar 未响应') && r1.includes('无法校验保温对象；已拒绝开启（不假装 ACTIVE）'), r1);
     const state = readState(tmpFile);
-    assert.equal(state.sessions[sessionId].on, true, '开启意图应保留，待 reconciler 补挂');
+    assert.equal(state.sessions[sessionId].on, false, 'sidecar 不可达时绝不假装 ACTIVE');
     assert.equal(state.sessions[sessionId].waiting, false);
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }
 });
 
-test('KI-3: /HTON 存储 key 漂移（409）自动轮换到新鲜 key', async (t) => {
+test('KI-3: /HTON 存储 key 漂移（历史脏 key）-> 自动采用确定性派生 key 校验开启', async (t) => {
   const tmpFile = path.join(os.tmpdir(), `dsh-cmd-ki3-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  const sessionId = 'test-duty-drift';
+  const derivedKey = sessionKeyFor(sessionId);
+
   await startFakeSidecar(t, (url, body) => {
     if (url === '/sessions') {
-      return { status: 200, json: { sessions: [{ key: 'dshsc-fresh', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+      return { status: 200, json: { sessions: [{ key: derivedKey, lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+    }
+    if (url === '/control/verify') {
+      const parsed = JSON.parse(body || '{}');
+      if (parsed.key === derivedKey) return { status: 200, json: { ok: true, actualPromptTokens: 100 } };
+      return { status: 200, json: { ok: false, reasons: ['no-request-recorded'] } };
     }
     if (url === '/control/on') {
       const key = JSON.parse(body || '{}').key;
-      if (key === 'dshsc-fresh') return { status: 200, json: { ok: true, immediatePing: true, state: {} } };
+      if (key === derivedKey) return { status: 200, json: { ok: true, immediatePing: true, state: {} } };
       return { status: 409, json: { error: 'no-request-recorded', waiting: true } };
     }
     if (url === '/control/off') return { status: 200, json: { ok: true } };
@@ -195,14 +227,13 @@ test('KI-3: /HTON 存储 key 漂移（409）自动轮换到新鲜 key', async (t
 
   try {
     const { updateSessionState } = await import('../lib/state.mjs');
-    const sessionId = 'test-duty-drift';
-    // 模拟漂移前存下的旧 key
+    // 模拟历史脏数据中存下的漂移 key
     updateSessionState(tmpFile, sessionId, { key: 'dshsc-stale', on: false, intervalMin: 30 });
 
     const r = await executeHton(sessionId, tmpFile);
-    assert.equal(r, '💓 心跳已开启（间隔 30min），已立即执行首次保温', '轮换成功应直接开启而非 waiting');
+    assert.equal(r, '💓 心跳已开启（窗口 20-30min，窗口内每 5s 突发至成功，前缀 100 token），已立即执行首次探测');
     const state = readState(tmpFile);
-    assert.equal(state.sessions[sessionId].key, 'dshsc-fresh');
+    assert.equal(state.sessions[sessionId].key, derivedKey, 'key 必须由 sessionId 确定性派生，纠正历史脏 key');
     assert.equal(state.sessions[sessionId].waiting, false);
     assert.equal(state.sessions[sessionId].on, true);
   } finally {
@@ -210,11 +241,17 @@ test('KI-3: /HTON 存储 key 漂移（409）自动轮换到新鲜 key', async (t
   }
 });
 
-test('KI-3: /HTON 全新会话无流量（非存储 key）-> 不轮换，保持 waiting 语义', async (t) => {
+test('KI-3: /HTON 全新会话无流量 -> 采用派生 key 并保持 waiting 语义', async (t) => {
   const tmpFile = path.join(os.tmpdir(), `dsh-cmd-ki3c-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  const sessionId = 'test-duty-brand-new';
+  const derivedKey = sessionKeyFor(sessionId);
+
   await startFakeSidecar(t, (url) => {
     if (url === '/sessions') {
-      return { status: 200, json: { sessions: [{ key: 'dshsc-only', lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+      return { status: 200, json: { sessions: [{ key: derivedKey, lastSeenAt: new Date().toISOString(), model: 'k3' }] } };
+    }
+    if (url === '/control/verify') {
+      return { status: 200, json: { ok: false, reasons: ['no-request-recorded'] } };
     }
     if (url === '/control/on') return { status: 409, json: { error: 'no-request-recorded', waiting: true } };
     if (url === '/control/off') return { status: 200, json: { ok: true } };
@@ -222,12 +259,11 @@ test('KI-3: /HTON 全新会话无流量（非存储 key）-> 不轮换，保持 
   });
 
   try {
-    const sessionId = 'test-duty-brand-new';
     const r = await executeHton(sessionId, tmpFile);
-    assert.ok(r.includes('心跳意图已记录'), '首次解析的 key 409 应保持 waiting 语义: ' + r);
+    assert.ok(r.includes('已登记等待') && r.includes('下一次真实请求'), '首次解析的 key 409 应保持 waiting 语义: ' + r);
     const state = readState(tmpFile);
     assert.equal(state.sessions[sessionId].waiting, true);
-    assert.equal(state.sessions[sessionId].key, 'dshsc-only');
+    assert.equal(state.sessions[sessionId].key, derivedKey);
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }
